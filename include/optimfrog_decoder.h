@@ -13,10 +13,12 @@ class OFR_DecoderEngine {
 public:
     virtual ~OFR_DecoderEngine();
     virtual bool open(ReadInterfaceWrapper* wrapper);
-    virtual bool read(void* dest, uInt32_t count);
+    virtual uInt32_t read(void* dest, uInt32_t count);
     virtual bool seek(sInt64_t sample_pos);
     virtual bool readTail();
     virtual void close();
+
+    uInt32_t block_decode(void* dest, uInt32_t count);
 
     sInt64_t total_samples; // 0x8
     uint8_t stream_stuff[0x48 - 0x10]; // 0x10
@@ -35,7 +37,14 @@ public:
     uInt32_t channels; // 0x80
     uInt32_t bitspersample; // 0x84
     bool has_recoverable_errors; // 0x88
-    uint8_t pad3[7]; // 0x89
+    
+    uInt32_t block_size;
+    uInt32_t block_pos;
+    sInt64_t samples_read_so_far;
+    bool need_new_block;
+    bool block_error;
+    sInt64_t block_end_pos;
+    void* corr_stream;
 };
 
 struct OptimFROG_InternalState {

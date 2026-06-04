@@ -36,6 +36,14 @@ struct BitStream {
 bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
     if (!wrapper || !wrapper->rInt) return false;
     
+    memcpy(this->stream_stuff, &wrapper, sizeof(ReadInterfaceWrapper*));
+    this->samples_read_so_far = 0;
+    this->need_new_block = true;
+    this->block_error = false;
+    this->block_size = 0;
+    this->block_pos = 0;
+    this->corr_stream = nullptr;
+    
     BitStream bs(wrapper);
     
     // find 'OFR '
@@ -116,7 +124,73 @@ bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
     return false;
 }
 
-bool OFR_DecoderEngine::read(void* dest, uInt32_t count) { return false; }
+uInt32_t OFR_DecoderEngine::block_decode(void* dest, uInt32_t count) {
+    return count;
+}
+
+uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
+    if (count == 0 || this->samples_read_so_far >= this->total_samples) {
+        return 0;
+    }
+
+    ReadInterfaceWrapper* wrapper;
+    memcpy(&wrapper, this->stream_stuff, sizeof(ReadInterfaceWrapper*));
+    BitStream bs(wrapper);
+
+    uint32_t read_so_far = 0;
+    do {
+        if (this->need_new_block) {
+            uint32_t comp_magic = bs.readU32();
+            if (comp_magic != 0x504d4f43) { // 'COMP'
+                this->has_recoverable_errors = true;
+                return read_so_far; 
+            }
+
+            uint32_t compressed_size = bs.readU32();
+            uint32_t skipped = bs.readU32();
+            uint32_t uncompressed_size = bs.readU32();
+            
+            (void)compressed_size;
+            (void)skipped;
+
+            this->block_size = uncompressed_size;
+            this->block_pos = 0;
+            this->need_new_block = false;
+            this->block_error = false;
+        }
+
+        uint32_t remaining_in_block = this->block_size - this->block_pos;
+        uint32_t to_read = count - read_so_far;
+        if (remaining_in_block < to_read) {
+            to_read = remaining_in_block;
+        }
+
+        uint32_t bytes_per_sample = (this->bitspersample / 8) * this->channels;
+        uint8_t* dest_ptr = (uint8_t*)dest + read_so_far * bytes_per_sample;
+
+        if (!this->block_error) {
+            this->block_decode(dest_ptr, to_read);
+            
+            if (!this->block_error) {
+                read_so_far += to_read;
+            } else {
+                memset(dest_ptr, 0, to_read * bytes_per_sample);
+            }
+        } else {
+            memset(dest_ptr, 0, to_read * bytes_per_sample);
+        }
+
+        this->block_pos += to_read;
+        this->samples_read_so_far += to_read;
+
+        if (this->block_pos == this->block_size) {
+            this->need_new_block = true;
+        }
+
+    } while (read_so_far < count && this->samples_read_so_far < this->total_samples);
+
+    return read_so_far;
+}
 bool OFR_DecoderEngine::seek(sInt64_t sample_pos) { return false; }
 bool OFR_DecoderEngine::readTail() { return false; }
 void OFR_DecoderEngine::close() {}

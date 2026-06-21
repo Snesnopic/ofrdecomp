@@ -3,6 +3,8 @@
 #include "OptimFROG.h"
 
 int main(int argc, char** argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     std::cout << "OptimFROGcpp Decoder v" << OptimFROG_getVersion() << std::endl;
     
     if (argc < 2) {

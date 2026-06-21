@@ -85,17 +85,33 @@ struct OFR_RangeCoder {
     
     void normalize();
     uint32_t read_uniform_split(uint32_t bits) {
+        if (bits <= 12) return read_uniform_bits(bits);
+        uint32_t val1 = read_uniform_bits(12);
+        uint32_t val2 = read_uniform_split(bits - 12);
+        return (val2 << 12) | val1;
+    }
+
+    uint32_t read_uniform_bits(uint32_t bits) {
         uint32_t ret = 0;
         uint32_t shift = 0;
         while (bits > 12) {
-            ret |= (read_uniform_bits(12) << shift);
+            ret |= (read_uniform_bits_internal(12) << shift);
             shift += 12;
             bits -= 12;
         }
         if (bits > 0) {
-            ret |= (read_uniform_bits(bits) << shift);
+            ret |= (read_uniform_bits_internal(bits) << shift);
         }
         return ret;
+    }
+    
+    uint32_t read_golomb() {
+        uint32_t k = 0;
+        while (read_uniform_bits(1) == 0) {
+            k++;
+        }
+        if (k == 0) return 0;
+        return (1u << k) | read_uniform_bits(k);
     }
     
     uint32_t read_uniform_bits_16() {
@@ -105,12 +121,13 @@ struct OFR_RangeCoder {
     }
     
 
-    uint32_t read_uniform_bits(uint32_t bits) {
+    uint32_t read_uniform_bits_internal(uint32_t bits) {
         if (bits == 0) return 0;
         normalize();
         uint32_t step = this->range >> bits;
         uint32_t val = this->value / step;
         uint32_t max_val = (1u << bits) - 1;
+
         if (val < max_val) {
             this->value -= val * step;
             this->range = step;
@@ -195,6 +212,7 @@ public:
     uint32_t bit_depth;
     uint32_t channels;
     uint32_t decoded_samples;
+    uint32_t type;
     bool needs_init;
 
     // 9 sub-contexts (FUN_00113f50(lVar16+0x58, 9, 9, 0x8000))
@@ -207,13 +225,22 @@ public:
     uint32_t master_limit;        // *(param_1+0x40)
     uint32_t master_num_nodes;    // *(param_1+0x44)
 
+    // Escape adaptive Huffman context
+    std::vector<uint32_t> escape_freqs;
+    uint32_t escape_num_symbols;
+    uint32_t escape_total_freq;
+    uint32_t escape_limit;
+    uint32_t escape_num_nodes;
+
     OFR_EntropyDecoder() : is_fast_stereo(false), weight(0.0), weight2(0.0),
         variance(1.0), variance2(1.0), bit_depth(0), channels(1),
         decoded_samples(0), needs_init(true),
         master_num_symbols(32), master_total_freq(32),
-        master_limit(0x8000), master_num_nodes(32) {}
+        master_limit(0x8000), master_num_nodes(32),
+        escape_num_symbols(32), escape_total_freq(32),
+        escape_limit(0x8000), escape_num_nodes(32) {}
 
-    void init(uint32_t depth, uint32_t ch, bool fast_stereo);
+    void init(uint32_t depth, uint32_t ch, uint32_t entropy_type, bool fast_stereo);
     void init_from_bitstream(OFR_RangeCoder* rc);
     int32_t decode_block(int32_t* dest, uint32_t count, OFR_RangeCoder* rc);
 
@@ -238,6 +265,10 @@ public:
     int shift;
     int min_val;
     int max_val;
+    int integrate;
+    int last_int[8];
+
+    void init(OFR_RangeCoder* rc, uint32_t bit_depth);
     
     std::vector<double> history_buffer;
     double* history_head;
@@ -347,9 +378,10 @@ public:
 
 class OFR_PostProcessor {
 public:
-    void init(OFR_RangeCoder* rc, uint32_t bit_depth);
+    void init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t channels);
 
 public:
+    uint32_t m_channels;
 
     int min_val_L;
     int max_val_L;
@@ -373,7 +405,7 @@ public:
                           scaled_min_L(-0x800000), scaled_max_L(0x7fffff), scaled_min_R(-0x800000), scaled_max_R(0x7fffff),
                           flag8(true) {}
     
-    void decode(int* dest, int count);
+    void decode(int* dest, int count, int channels);
 };
 
 
@@ -389,10 +421,13 @@ public:
     
     void decode_block(uint32_t* dest, uint32_t count, OFR_RangeCoder* rc) {
         if (entropy) entropy->decode_block((int32_t*)dest, count, rc);
-        if (predictor) predictor->decode((int*)dest, count);
+        if (predictor) {
+            predictor->decode((int*)dest, count);
+
+        }
         if (predictor_fast_stereo) predictor_fast_stereo->decode((int*)dest, count);
         if (predictor_stereo) predictor_stereo->decode((int32_t*)dest, count, (int32_t*)dest, rc);
-        if (post_processor) post_processor->decode((int*)dest, count);
+        if (post_processor) post_processor->decode((int*)dest, count, post_processor->m_channels);
     }
 };
 

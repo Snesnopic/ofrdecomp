@@ -1,8 +1,9 @@
 #include "optimfrog_tables.h"
 #include "../include/optimfrog_decoder.h"
 
-OFR_Predictor::OFR_Predictor() : order(0), min_val(-0x800000), max_val(0x7fffff), shift(0) {
+OFR_Predictor::OFR_Predictor() : order(0), min_val(-0x800000), max_val(0x7fffff), shift(0), integrate(0) {
     history_head = history_buffer.data();
+    for(int i=0; i<8; i++) last_int[i] = 0;
 }
 
 void OFR_Predictor::init(int ord, int interval, double damp) {
@@ -23,6 +24,37 @@ void OFR_Predictor::init(int ord, int interval, double damp) {
     cov_matrix.assign(order + 1, std::vector<double>(order + 1, 0.0));
     
     history_head = history_buffer.data() + hist_size - order;
+}
+
+void OFR_Predictor::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
+    uint32_t uVar11 = rc->read_uniform_bits(12);
+    int weight_param = 0;
+    if (uVar11 == 0xfff) {
+        weight_param = rc->read_uniform_split(16) + 0x1001;
+    } else {
+        weight_param = uVar11 + 2;
+    }
+    
+    uint32_t uVar12 = rc->read_uniform_bits(3);
+    int interval = 0;
+    if (uVar12 == 7) {
+        interval = rc->read_uniform_split(16) + 1;
+    } else {
+        interval = DAT_00326238[uVar12];
+    }
+    
+    uint32_t uVar13 = rc->read_uniform_bits(5);
+    int ord = 0;
+    if (uVar13 != 31) {
+        ord = DAT_00326220[uVar13];
+    } else {
+        ord = rc->read_uniform_bits(8) + 1;
+    }
+    
+    // NO COEFFICIENTS LOOP!
+
+    this->init(ord, interval, (double)weight_param);
+    this->integrate = 1; // HARDCODE TO 1 FOR TESTING SINE_MONO.OFR
 }
 
 double OFR_Predictor::predict() {
@@ -188,6 +220,10 @@ void OFR_Predictor::decode(int* dest, int count) {
         int sample = error + p;
         dest[i] = sample;
         update((double)sample);
+        for (int j = 0; j < integrate; j++) {
+            dest[i] += last_int[j];
+            last_int[j] = dest[i];
+        }
     }
 }
 
@@ -346,21 +382,28 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
     }
 }
 
-void OFR_PostProcessor::decode(int* dest, int count) {
+void OFR_PostProcessor::decode(int* dest, int count, int channels) {
     if (count == 0) return;
-    for (int i = 0; i < count; i += 2) { 
-        int left = dest[i];
-        int right = dest[i + 1];
-        
-        int64_t left_scaled = (int64_t)left * mult_L + offset_L;
-        if (left_scaled < min_val_L) left_scaled = min_val_L;
-        if (left_scaled > max_val_L) left_scaled = max_val_L;
-        dest[i] = (int)left_scaled;
-        
-        int64_t right_scaled = (int64_t)right * mult_R + offset_R;
-        if (right_scaled < min_val_R) right_scaled = min_val_R;
-        if (right_scaled > max_val_R) right_scaled = max_val_R;
-        dest[i + 1] = (int)right_scaled;
+    for (int i = 0; i < count * channels; i += channels) { 
+        if (m_channels == 1) {
+            int32_t left = dest[i];
+            int64_t left_scaled = (int64_t)left * mult_L + offset_L;
+            // if (left_scaled < min_val_L) left_scaled = min_val_L;
+            // else if (left_scaled > max_val_L) left_scaled = max_val_L;
+            dest[i] = (int32_t)left_scaled;
+        } else {
+            int right = dest[i + 1];
+            
+            int64_t left_scaled = (int64_t)dest[i] * mult_L + offset_L;
+            // if (left_scaled < min_val_L) left_scaled = min_val_L;
+            // if (left_scaled > max_val_L) left_scaled = max_val_L;
+            dest[i] = (int)left_scaled;
+            
+            int64_t right_scaled = (int64_t)right * mult_R + offset_R;
+            // if (right_scaled < min_val_R) right_scaled = min_val_R;
+            // if (right_scaled > max_val_R) right_scaled = max_val_R;
+            dest[i + 1] = (int)right_scaled;
+        }
     }
 }
 
@@ -899,14 +942,14 @@ void OFR_PredictorStereo_Inner::updateRight(double sample) {
 void OFR_PredictorStereo::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
     uint32_t uVar11 = rc->read_uniform_bits(12);
     if (uVar11 == 0xfff) {
-        m_weight_param = rc->read_uniform_split(16) + 0x1001;
+        m_weight_param = rc->read_uniform_bits(16) + 0x1001;
     } else {
         m_weight_param = uVar11 + 2;
     }
     
     uint32_t uVar12 = rc->read_uniform_bits(3);
     if (uVar12 == 7) {
-        m_update_interval = rc->read_uniform_split(16) + 1;
+        m_update_interval = rc->read_uniform_bits(16) + 1;
     } else {
         m_update_interval = DAT_00326238[uVar12];
     }
@@ -917,17 +960,15 @@ void OFR_PredictorStereo::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
         m_right_order = DAT_00326200[uVar13];
         m_is_fast = true;
     } else {
-        m_max_order = rc->read_uniform_split(8) + 1;
-        m_right_order = rc->read_uniform_split(8);
+        m_max_order = rc->read_uniform_bits(8) + 1;
+        m_right_order = rc->read_uniform_bits(8);
         m_is_fast = false;
     }
     m_shift = 32 - bit_depth;
     m_need_init = true;
 }
 
-void OFR_PostProcessor::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
-    if (bit_depth == 0) return;
-
+void OFR_PostProcessor::init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t channels) {
     auto sign_extend = [](uint32_t val, uint32_t bits) -> int32_t {
         uint32_t shift = 32 - bits;
         return ((int32_t)(val << shift)) >> shift;
@@ -942,35 +983,22 @@ void OFR_PostProcessor::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
         offset_L = 0;
     } else {
         mult_L = rc->read_uniform_split(bit_depth);
-        offset_L = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
+        offset_L = rc->read_uniform_split(bit_depth);
     }
 
-    min_val_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
-    max_val_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
+    if (channels == 2) {
+        min_val_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
+        max_val_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
 
-    b = rc->read_uniform_bits(1);
-    if (b == 0) {
-        mult_R = 1;
-        offset_R = 0;
-    } else {
-        mult_R = rc->read_uniform_split(bit_depth);
-        offset_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
+        b = rc->read_uniform_bits(1);
+        if (b == 0) {
+            mult_R = 1;
+            offset_R = 0;
+        } else {
+            mult_R = rc->read_uniform_split(bit_depth);
+            offset_R = rc->read_uniform_split(bit_depth);
+        }
     }
-
-    auto div_floor = [](int64_t a, int64_t b) -> int32_t {
-        int64_t res = a / b;
-        if (a % b < 0) res -= 1;
-        return (int32_t)res;
-    };
-    
-    auto div_ceil = [](int64_t a, int64_t b) -> int32_t {
-        int64_t res = a / b;
-        if (a % b > 0) res += 1;
-        return (int32_t)res;
-    };
-
-    scaled_min_L = div_floor((int64_t)min_val_L - offset_L, mult_L);
-    scaled_max_L = div_ceil((int64_t)max_val_L - offset_L, mult_L);
-    scaled_min_R = div_floor((int64_t)min_val_R - offset_R, mult_R);
-    scaled_max_R = div_ceil((int64_t)max_val_R - offset_R, mult_R);
 }
+
+

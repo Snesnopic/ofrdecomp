@@ -1,0 +1,16 @@
+@@ -125,15 +125,11 @@
+         int16_t* dest16 = (int16_t*)dest;
+         for (uint32_t i = 0; i < num_samples; ++i) {
+             dest16[i] = (int16_t)src32[i];
+-            if (i < 10) {
+-            }
+         }
+     } else {
+         int32_t* dest32 = (int32_t*)dest;
+         for (uint32_t i = 0; i < num_samples; ++i) {
+             dest32[i] = src32[i];
+-            if (i < 10) {
+-            }
+         }
+     }
+ 

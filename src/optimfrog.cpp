@@ -422,9 +422,9 @@ sInt32_t OptimFROG_decodeFile(char* sourceFile, char* destinationFile, OptimFROG
     
     sInt64_t points_read = 0;
     uInt32_t bytes_per_point = (info.bitspersample / 8) * info.channels;
-    uInt32_t points_per_chunk = 0x2b110 / bytes_per_point;
+    uInt32_t points_per_chunk = 10;
     
-    while (points_read < info.noPoints) {
+    while (points_read < 10) {
         if (callBack) {
             callBack(callBackParam, (double)points_read * 100.0 / (double)info.noPoints);
         }

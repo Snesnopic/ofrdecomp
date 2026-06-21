@@ -119,11 +119,19 @@ uInt32_t OFR_DecoderEngine::block_decode(void* dest, uInt32_t count) {
     uint32_t samples_to_decode = count * this->channels;
     this->block_decoder.decode_block((uint32_t*)this->decode_buffer, samples_to_decode, &this->range_coder);
     
-    int32_t* dest32 = (int32_t*)dest;
-    int32_t* src32 = this->decode_buffer;
     uint32_t num_samples = samples_to_decode * this->channels;
-    for (uint32_t i = 0; i < num_samples; ++i) {
-        dest32[i] = src32[i];
+    int32_t* src32 = this->decode_buffer;
+    if (this->bitspersample == 16) {
+        int16_t* dest16 = (int16_t*)dest;
+        for (uint32_t i = 0; i < num_samples; ++i) {
+            dest16[i] = (int16_t)src32[i];
+            if (i < 10) {
+        }
+    } else {
+        int32_t* dest32 = (int32_t*)dest;
+        for (uint32_t i = 0; i < num_samples; ++i) {
+            dest32[i] = src32[i];
+        }
     }
 
     
@@ -164,7 +172,7 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             uint32_t post_type = uVar15 & 0x3f;
             uint32_t pred_type = (uVar15 >> 6) & 0x1f;
             uint32_t reduced_bit_depth = this->bitspersample;
-            
+
             // PostProcessor
             if (post_type != 0) {
                 if (!this->block_decoder.post_processor) {
@@ -174,19 +182,26 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             }
             
             // Predictor
-            if (pred_type == 1) {
-                if (!this->block_decoder.predictor_stereo) {
-                    this->block_decoder.predictor_stereo = new OFR_PredictorStereo();
+            if (pred_type != 0) {
+                if (this->channels == 2) {
+                    if (!this->block_decoder.predictor_stereo) {
+                        this->block_decoder.predictor_stereo = new OFR_PredictorStereo();
+                    }
+                    this->block_decoder.predictor_stereo->init(&this->range_coder, reduced_bit_depth);
+                } else {
+                    if (!this->block_decoder.predictor) {
+                        this->block_decoder.predictor = new OFR_Predictor();
+                    }
+                    this->block_decoder.predictor->init(&this->range_coder, reduced_bit_depth);
                 }
-                this->block_decoder.predictor_stereo->init(&this->range_coder, this->bitspersample);
             }
             
             // Entropy Coder
             if (entropy_type != 0) {
                 if (!this->block_decoder.entropy) {
                     this->block_decoder.entropy = new OFR_EntropyDecoder();
-                    this->block_decoder.entropy->init(13, this->channels, entropy_type, true);
                 }
+                this->block_decoder.entropy->init(13, this->channels, entropy_type, true);
                 this->block_decoder.entropy->init_from_bitstream(&this->range_coder);
             }
 

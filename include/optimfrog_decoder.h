@@ -180,6 +180,16 @@ struct OFR_RangeCoder {
         return sym;
     }
 
+    uint32_t read_12bit_value() {
+        uint32_t uVar11 = decode_uniform(4096); // 12 bits means range 0..4095
+        if (uVar11 == 0xfff) {
+            uVar11 = decode_uniform(65536) + 0x1001; // 16 bits means range 0..65535
+        } else {
+            uVar11 += 2;
+        }
+        return uVar11;
+    }
+
     uint32_t decode_uniform(uint32_t max_val) {
         if (max_val == 0) return 0;
         normalize();
@@ -246,6 +256,20 @@ public:
 
     // Core per-sample decode (mirrors FUN_00109ab0)
     int32_t decode_one_sample(double& var, OFR_RangeCoder* rc);
+
+    // --- fast stereo path (FUN_00004710 / FUN_00005ef0) ---
+    struct FastCtx {
+        std::vector<uint32_t> freqs;
+        uint32_t num_symbols;
+        uint32_t total_freq;
+        uint32_t limit;
+        uint32_t num_nodes;
+    };
+    std::vector<FastCtx> fast_contexts;
+    double fast_var_L;
+    double fast_var_R;
+    bool fast_inited;
+    int32_t fast_decode_sample(double& var, OFR_RangeCoder* rc);
 
 private:
     uint32_t rebuild_master(uint32_t node);
@@ -359,7 +383,10 @@ struct OFR_PredictorStereo {
     ProgressCallback m_progress_cb;  // 0x65CB0
     bool m_is_fast;                  // 0x65CB8
     void init(OFR_RangeCoder* rc, uint32_t bit_depth);
-    void decode(int32_t* input, uint32_t num_samples, int32_t* outputs, OFR_RangeCoder* rc);
+    void init_from_bitstream(OFR_RangeCoder* rc) {
+        m_need_init = true;
+    }
+    void decode(int32_t* outputs, uint32_t num_samples);
 };
 
 class OFR_PredictorFastStereo {
@@ -426,7 +453,7 @@ public:
 
         }
         if (predictor_fast_stereo) predictor_fast_stereo->decode((int*)dest, count);
-        if (predictor_stereo) predictor_stereo->decode((int32_t*)dest, count, (int32_t*)dest, rc);
+        if (predictor_stereo) predictor_stereo->decode((int32_t*)dest, count);
         if (post_processor) post_processor->decode((int*)dest, count, post_processor->m_channels);
     }
 };

@@ -2,6 +2,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <algorithm>
+
+// FUN_00018d80: bit-length of the data range (min,max) → entropy bit depth / shift source
+static int ofr_bitlen(int mn, int mx) {
+    uint32_t a = (uint32_t)((mn >> 31) ^ mn);
+    uint32_t b = (uint32_t)((mx >> 31) ^ mx);
+    if (a == 0 && b == 0) return 1;
+    uint32_t m = ((int)b <= (int)a) ? a : b;
+    uint32_t u = (m < 0x10000u) ? m : (m >> 16);
+    uint32_t bits = (m > 0xffffu) ? 16u : 0u;
+    if (u > 0xffu) { u >>= 8; bits += 8; }
+    if (u > 0xfu)  { u >>= 4; bits += 4; }
+    if (u > 3u)    { u >>= 2; bits += 2; }
+    return (int)(bits + 2u + (u > 1u ? 1u : 0u));
+}
 
 OFR_DecoderEngine::~OFR_DecoderEngine() {}
 
@@ -118,15 +133,13 @@ bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
 uInt32_t OFR_DecoderEngine::block_decode(void* dest, uInt32_t count) {
     uint32_t samples_to_decode = count * this->channels;
     this->block_decoder.decode_block((uint32_t*)this->decode_buffer, samples_to_decode, &this->range_coder);
-    
+
     int32_t* dest32 = (int32_t*)dest;
     int32_t* src32 = this->decode_buffer;
-    uint32_t num_samples = samples_to_decode * this->channels;
-    for (uint32_t i = 0; i < num_samples; ++i) {
+    for (uint32_t i = 0; i < samples_to_decode; ++i) {
         dest32[i] = src32[i];
     }
 
-    
     return count;
 }
 
@@ -159,12 +172,12 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             bs->readU8();
             
             this->range_coder.init(bs);
-            
+
             uint32_t entropy_type = uVar15 >> 11;
             uint32_t post_type = uVar15 & 0x3f;
             uint32_t pred_type = (uVar15 >> 6) & 0x1f;
             uint32_t reduced_bit_depth = this->bitspersample;
-            
+
             // PostProcessor
             if (post_type != 0) {
                 if (!this->block_decoder.post_processor) {
@@ -172,25 +185,62 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                 }
                 this->block_decoder.post_processor->init(&this->range_coder, reduced_bit_depth, this->channels);
             }
-            
-            // Predictor
-            if (pred_type == 1) {
-                if (!this->block_decoder.predictor_stereo) {
-                    this->block_decoder.predictor_stereo = new OFR_PredictorStereo();
+
+            // data bit-length (local_4c in FUN_00010870) drives predictor shift and entropy depth
+            int data_bits = 13;
+            if (post_type != 0) {
+                OFR_PostProcessor* pp = this->block_decoder.post_processor;
+                if (this->channels == 2) {
+                    int mn = std::min(pp->min_val_L, pp->min_val_R);
+                    int mx = std::max(pp->max_val_L, pp->max_val_R);
+                    data_bits = ofr_bitlen(mn, mx);
+                } else {
+                    data_bits = ofr_bitlen(pp->min_val_L, pp->max_val_L);
                 }
-                this->block_decoder.predictor_stereo->init(&this->range_coder, this->bitspersample);
             }
-            
+
+            // Predictor — dispatch on channels
+            if (pred_type == 1) {
+                if (this->channels == 1) {
+                    if (!this->block_decoder.predictor) {
+                        this->block_decoder.predictor = new OFR_Predictor();
+                    }
+                    OFR_Predictor* pd = this->block_decoder.predictor;
+                    pd->init(&this->range_coder, this->bitspersample);
+                    // FUN_00006f50: min/max/shift from post-processor
+                    if (post_type != 0) {
+                        OFR_PostProcessor* pp = this->block_decoder.post_processor;
+                        pd->min_val = pp->min_val_L;
+                        pd->max_val = pp->max_val_L;
+                    }
+                    pd->shift = 32 - data_bits;
+                } else {
+                    if (!this->block_decoder.predictor_stereo) {
+                        this->block_decoder.predictor_stereo = new OFR_PredictorStereo();
+                    }
+                    OFR_PredictorStereo* ps = this->block_decoder.predictor_stereo;
+                    ps->init(&this->range_coder, this->bitspersample);
+                    ps->init_from_bitstream(&this->range_coder);
+                    // FUN_00007400: copy postproc min/max and shift into predictor
+                    OFR_PostProcessor* pp = this->block_decoder.post_processor;
+                    ps->m_left_min  = pp->min_val_L;
+                    ps->m_left_max  = pp->max_val_L;
+                    ps->m_right_min = pp->min_val_R;
+                    ps->m_right_max = pp->max_val_R;
+                    ps->m_shift = 32u - (uint32_t)data_bits;
+                }
+            }
+
             // Entropy Coder
             if (entropy_type != 0) {
                 if (!this->block_decoder.entropy) {
                     this->block_decoder.entropy = new OFR_EntropyDecoder();
-                    this->block_decoder.entropy->init(13, this->channels, entropy_type, true);
+                    this->block_decoder.entropy->init((uint32_t)data_bits, this->channels, entropy_type, true);
                 }
                 this->block_decoder.entropy->init_from_bitstream(&this->range_coder);
             }
 
-            this->block_size = uncompressed_size;
+            this->block_size = uncompressed_size / this->channels;
             this->block_pos = 0;
             this->need_new_block = false;
             this->block_error = false;
@@ -202,19 +252,19 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             to_read = remaining_in_block;
         }
 
-        uint32_t bytes_per_sample = (this->bitspersample / 8) * this->channels;
-        uint8_t* dest_ptr = (uint8_t*)dest + read_so_far * bytes_per_sample;
+        // dest holds int32 interleaved samples; advance by frames*channels
+        int32_t* dest_ptr = (int32_t*)dest + (size_t)read_so_far * this->channels;
 
         if (!this->block_error) {
             this->block_decode(dest_ptr, to_read);
-            
+
             if (!this->block_error) {
                 read_so_far += to_read;
             } else {
-                memset(dest_ptr, 0, to_read * bytes_per_sample);
+                memset(dest_ptr, 0, (size_t)to_read * this->channels * sizeof(int32_t));
             }
         } else {
-            memset(dest_ptr, 0, to_read * bytes_per_sample);
+            memset(dest_ptr, 0, (size_t)to_read * this->channels * sizeof(int32_t));
         }
 
         this->block_pos += to_read;

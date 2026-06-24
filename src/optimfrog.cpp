@@ -263,7 +263,7 @@ sInt32_t OptimFROG_read(void* decoderInstance, void* data, uInt32_t noPoints, co
     auto* pInt = instance->pInterface;
     
     sInt64_t points_to_read = noPoints;
-    sInt64_t points_left = pInt->total_samples - instance->points_read_so_far;
+    sInt64_t points_left = instance->noPoints - instance->points_read_so_far;
     
     if (points_to_read > points_left) {
         points_to_read = points_left;

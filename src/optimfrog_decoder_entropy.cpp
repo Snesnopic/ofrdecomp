@@ -79,41 +79,15 @@ void OFR_EntropyDecoder::halve_master() {
     rebuild_master(1);
 }
 
-// Called once per block to prepare the entropy decoder.
-// Per the binary (FUN_00109460):
-//   *(param_1+0x2c) = block_size  (not read from range coder)
-//   *(param_1+0x28) = bit_depth   (not read from range coder)
-// The weight/weight2 are read from the range coder by FUN_00106eb0 which is called
-// the FIRST time decode_block is invoked (when needs_init=true / param_1+0x4c != 0).
-// This call happens inside FUN_00109470 / FUN_00109530 automatically.
-// So init_from_bitstream should NOT read from the range coder.
+// FUN_00004220 — called once per block.
+// Reads 12-bit weight param from RC (via read_12bit_value which matches FUN_00004220 exactly).
+// Sets needs_init=true so decode_block will reset the master context before the first sample.
 void OFR_EntropyDecoder::init_from_bitstream(OFR_RangeCoder* rc) {
-    // ---- Master context ----
-    // FUN_00105c60(param_1+0x30, 0x20, 0x8000)
-    // → num_symbols=32, limit=0x8000
-    master_num_symbols = 32u;
-    master_limit       = 0x8000u;
-    master_num_nodes   = 32u;
-    master_freqs.assign(master_num_nodes * 2, 0);
-    for (uint32_t i = 0; i < master_num_symbols; ++i)
-        master_freqs[master_num_nodes + i] = 1;
-    master_total_freq = master_num_symbols;
-
-    rebuild_master(1);
-
-    // ---- Sub-contexts ----
-    // FUN_00113f50(lVar16+0x58, 9, 9, 0x8000) → 9 contexts, each 9 symbols, limit 0x8000
-    contexts.resize(9);
-    for (auto& c : contexts)
-        c.init(9u, 0x8000u);
-
-    // ---- Reset state ----
-    // variance resets to 0.0 per FUN_00109470: *(param_1+0x18) = 0
-    variance  = 0.0;
-    variance2 = 0.0;
-    // needs_init = true so decode_block will read weight on first call (FUN_00106eb0)
-    needs_init      = true;
+    uint32_t w = rc->read_12bit_value();
+    weight  = (double)(w - 1) / (double)w;
+    weight2 = 1.0 / (double)w;
     decoded_samples = 0;
+    needs_init = true;
 }
 
 // ============================================================
@@ -362,9 +336,117 @@ emit:
 }
 
 // ============================================================
+// fast stereo entropy (FUN_00004710 / FUN_00005ef0)
+// ============================================================
+
+// rebuild one context tree: internal[node] = sum of left subtree (FUN_00002ea0)
+static uint32_t fast_rebuild(std::vector<uint32_t>& f, uint32_t node, uint32_t num_nodes) {
+    if (node < num_nodes) {
+        uint32_t l = fast_rebuild(f, node * 2, num_nodes);
+        uint32_t r = fast_rebuild(f, node * 2 + 1, num_nodes);
+        f[node] = l;
+        return l + r;
+    }
+    return f[node];
+}
+
+// FUN_00002bd0: init one context with num_symbols leaves
+static void fast_ctx_init(OFR_EntropyDecoder::FastCtx& c, uint32_t num_symbols, uint32_t limit) {
+    c.num_symbols = num_symbols;
+    uint32_t nn = 1;
+    while (nn < num_symbols) nn <<= 1;
+    c.num_nodes = nn;
+    c.limit = limit;
+    c.freqs.assign(nn * 2, 0u);
+    for (uint32_t i = 0; i < num_symbols; ++i) c.freqs[nn + i] = 1u;
+    c.total_freq = num_symbols;
+    fast_rebuild(c.freqs, 1, nn);
+}
+
+// FUN_00002df0: halve leaf frequencies and rebuild
+static void fast_ctx_halve(OFR_EntropyDecoder::FastCtx& c) {
+    c.total_freq = 0;
+    for (uint32_t i = 0; i < c.num_symbols; ++i) {
+        uint32_t& f = c.freqs[c.num_nodes + i];
+        f = ((f - 1u) >> 1) + 1u;
+        c.total_freq += f;
+    }
+    fast_rebuild(c.freqs, 1, c.num_nodes);
+}
+
+// FUN_00005ef0: decode one sample using the variance-indexed context
+int32_t OFR_EntropyDecoder::fast_decode_sample(double& var, OFR_RangeCoder* rc) {
+    uint64_t vbits;
+    std::memcpy(&vbits, &var, 8);
+    uint32_t idx = (uint32_t)((vbits >> 52) + 0xfffffc01u);   // unbiased exponent
+    FastCtx& c = fast_contexts[idx];
+    auto& f = c.freqs;
+
+    rc->normalize();
+    uint32_t step = rc->range / c.total_freq;
+    uint32_t v    = rc->value / step;
+    uint32_t bound = (v < c.total_freq) ? v : c.total_freq - 1u;
+
+    uint32_t node = 1, acc = 0;
+    do {
+        uint32_t nodeval = f[node];
+        uint32_t s = nodeval + acc;
+        uint32_t child;
+        if (bound < s) {
+            f[node] = nodeval + 2u;
+            child = node;
+        } else {
+            child = node + 1u;
+            acc = s;
+        }
+        node = node + child;
+    } while (node < c.num_nodes);
+
+    uint32_t leaf_freq = f[node];
+    uint32_t accstep   = step * acc;
+    rc->value -= accstep;
+    if (acc + leaf_freq < c.total_freq) rc->range = step * leaf_freq;
+    else                                rc->range -= accstep;
+    f[node] += 2u;
+    c.total_freq += 2u;
+    if (c.limit <= c.total_freq) fast_ctx_halve(c);
+
+    uint32_t symbol = node - c.num_nodes;
+    uint32_t value  = symbol;
+    if (symbol >= 8u) {
+        uint32_t group = (symbol - 8u) >> 3;
+        uint32_t extra = rc->read_uniform_bits(group);
+        value = (((symbol - 8u) & 7u) << group) + (1u << (group + 3u)) + extra;
+    }
+
+    var = (double)value * (double)value * weight2 + weight2 + var * weight;
+
+    return (int32_t)((value & 1u) ? ~(value >> 1) : (value >> 1));
+}
+
+// ============================================================
 // decode_block
 // ============================================================
 int32_t OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_RangeCoder* rc) {
+    if (type == 1 && channels == 2) {
+        if (needs_init) {
+            // FUN_00004710 init: num_contexts = bit_depth*2, per-ctx symbols from bit_depth
+            uint32_t num_contexts = bit_depth * 2u;
+            uint32_t per_symbols = (bit_depth < 4u) ? (1u << bit_depth) : (bit_depth * 8u - 0x10u);
+            fast_contexts.assign(num_contexts, FastCtx());
+            for (uint32_t i = 0; i < num_contexts; ++i)
+                fast_ctx_init(fast_contexts[i], per_symbols, 0x8000u);
+            fast_var_L = 1.0;
+            fast_var_R = 1.0;
+            needs_init = false;
+        }
+        for (uint32_t i = 0; i < count; i += 2) {
+            dest[i]     = fast_decode_sample(fast_var_L, rc);
+            dest[i + 1] = fast_decode_sample(fast_var_R, rc);
+        }
+        decoded_samples += count;
+        return 1;
+    }
     // The binary's FUN_00109470/FUN_00109530 checks *(param_1+0x4c) (needs_init).
     // If set:
     //   1. FUN_00105c60(param_1+0x30, 0x20, 0x8000) = reinit master context
@@ -439,48 +521,6 @@ int32_t OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_Rang
         variance  = 0.0;
         variance2 = 0.0;
 
-        // Read weight from range coder (FUN_00106eb0):
-        //   normalize to ≥ 0x800001
-        //   step = range >> 12  (divide by 4096)
-        //   q = value / step → value in [0, 4096)
-        //   if q < 4095: val = q + 2
-        //   else: val = FUN_0011a650(rc, ...) + 0x1001  [reads more bits]
-        //   weight2 = 1.0 / val   (which equals 1.0 - weight)
-        //   DAT_0011f008 = 1.0
-        rc->normalize();
-        uint32_t step12 = rc->range >> 12;
-        // param_2[2] = step12
-        uint32_t q12 = rc->value / step12;
-        uint32_t iVar9;
-        if (q12 < 0x1000u) {
-            uint32_t iVar13 = q12 * step12;
-            rc->value -= iVar13;
-            if ((q12 + 1u) >> 12 != 0) {
-                rc->range -= iVar13;
-                // => q12 == 0xfff, this is the "full range" case
-                iVar9 = q12 + 2u;
-            } else {
-                rc->range = step12;
-                iVar9 = q12 + 2u;
-            }
-        } else {
-            // q12 = 0xfff case (decode additional value)
-            // FUN_0011a650: reads a 16-bit value encoded in the range coder
-            // Simple approximation: just read it
-            q12 = 0xfffu;
-            uint32_t iVar13 = step12 * 0xfffu;
-            rc->value += (rc->range - iVar13);
-            // Wait: the decompilation says:
-            //   if (uVar10 + 1 >> 0xc != 0) goto LAB_00106f77;
-            //   LAB_00106f77: if (uVar8 == 0xfff) { uVar6 = FUN_0011a650(...); iVar9 = uVar6 + 0x1001; }
-            // For now approximate FUN_0011a650 as reading a uniform 16-bit value:
-            rc->range -= iVar13;
-            // FUN_0011a650: complex - skip for now, assume iVar9 = 0x1001 + 0
-            iVar9 = 0x1001u + 0u;
-        }
-
-        weight  = ((double)iVar9 - 1.0) / (double)iVar9;
-        weight2 = 1.0 / (double)iVar9;
 
         needs_init = false;
     }
@@ -489,8 +529,6 @@ int32_t OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_Rang
         // Stereo interleaving: even=L uses variance, odd=R uses variance2
         double& var = (channels == 2 && (i & 1)) ? variance2 : variance;
         dest[i] = decode_one_sample(var, rc);
-        if (i < 10) {
-        }
     }
     decoded_samples += count;
     return 1;

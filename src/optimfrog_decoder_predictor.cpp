@@ -19,6 +19,7 @@ void OFR_Predictor::init(int ord, int interval, double damp) {
     history_buffer.assign(hist_size, 0.0);
     vector_R.assign(order + 1, 0.0);
     weights.assign(order + 1, 0.0);
+    if (order > 0) weights[0] = 1.0;  // binary: FUN_00014dc0 initializes weights[0]=1.0
     temp_D.assign(order + 1, 0.0);
     inst_matrix.assign(order + 1, std::vector<double>(order + 1, 0.0));
     cov_matrix.assign(order + 1, std::vector<double>(order + 1, 0.0));
@@ -53,8 +54,7 @@ void OFR_Predictor::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
     
     // NO COEFFICIENTS LOOP!
 
-    this->init(ord, interval, (double)weight_param);
-    this->integrate = 1; // HARDCODE TO 1 FOR TESTING SINE_MONO.OFR
+    this->init(ord, interval, ((double)weight_param - 1.0) / (double)weight_param);
 }
 
 double OFR_Predictor::predict() {
@@ -122,7 +122,6 @@ void OFR_Predictor::update_weights() {
                     for (int j = 0; j < i; j++) {
                         cov_matrix[i][j+1] = (cov_matrix[i-1][j] - history_head[i] * history_head[j+1]) * damping_inv + inst_matrix[i][j+1] * damp_pow;
                     }
-                    inst_matrix[i][0] = vector_R[i];
                 }
             }
         } else {
@@ -213,17 +212,14 @@ void OFR_Predictor::update(double sample) {
 }
 
 void OFR_Predictor::decode(int* dest, int count) {
+    int sh = shift & 0x1f;
     for (int i = 0; i < count; i++) {
-        double pred = predict();
-        int p = (int)std::round(pred);
         int error = dest[i];
-        int sample = error + p;
-        dest[i] = sample;
-        update((double)sample);
-        for (int j = 0; j < integrate; j++) {
-            dest[i] += last_int[j];
-            last_int[j] = dest[i];
-        }
+        int p = (int)std::round(predict());
+        int cp = std::max(min_val, std::min(p, max_val));
+        int v = ((cp + error) << sh) >> sh;
+        dest[i] = v;
+        update((double)v);
     }
 }
 
@@ -516,62 +512,38 @@ void OFR_PredictorStereo_Inner::updateAutocorrRight() {
     R[0] = R[0] * w + h_prev * hr0;
 }
 
-void OFR_PredictorStereo::decode(int32_t* input, uint32_t num_samples, int32_t* outputs, OFR_RangeCoder* rc) {
+void OFR_PredictorStereo::decode(int32_t* outputs, uint32_t num_samples) {
     if (m_need_init) {
         double w = (static_cast<double>(m_weight_param) - 1.0) / static_cast<double>(m_weight_param);
         m_inner.init(w, m_max_order, m_max_order - m_right_order, m_update_interval);
-        m_sample_counter = 44100;
+        m_sample_counter = 0xac44;
         m_need_init = false;
     }
-    
-    if (num_samples != 0) {
-        for (uint32_t i = 0; i < num_samples; i += 2) {
-            m_sample_counter--;
-            if (m_sample_counter == 0) {
-                if (m_progress_cb) {
-                    m_progress_cb(static_cast<double>(i) / num_samples);
-                }
-                m_sample_counter = 44100;
-            }
-            
-            // Left Mid Residual is input[i]
-            int32_t res_left = input[i];
-            double pred_left = m_inner.predictLeft();
-            int32_t p_left = static_cast<int32_t>(std::floor(pred_left + 0.5));
-            
-            // Sign extend the prediction + residual
-            int32_t l_mid_raw = res_left + p_left;
-            int32_t l_mid = (l_mid_raw << (m_shift & 0x1F)) >> (m_shift & 0x1F);
-            
-            // Decode Side Residual from Range Coder if correction is 0 (m_shift is not used for this?)
-            // Wait, the binary uses *(uint *)(param_1 + 0xa5cc8) which is likely 1 for lossless.
-            int32_t side_res = 0;
-            if (!m_is_fast && m_weight_param != 1) {
-                uint32_t val = rc->decode_uniform(m_weight_param);
-                uint32_t uVar18 = val >> 1;
-                if (val & 1) uVar18 = ~uVar18;
-                side_res = static_cast<int32_t>(uVar18);
-            }
-            if (i == 274) {
-            }
+    if (num_samples == 0) return;
 
-            
-            outputs[i] = l_mid + side_res;
-            
-            m_inner.updateLeft(l_mid); // Wait! Update weights uses l_mid, not out_left!
-            
-            // Right Mid Residual is input[i + 1]
-            int32_t res_right = input[i + 1];
-            double pred_right = m_inner.predictRight();
-            int32_t p_right = static_cast<int32_t>(std::floor(pred_right + 0.5));
-            
-            int32_t r_mid_raw = res_right + p_right;
-            int32_t r_mid = (r_mid_raw << (m_shift & 0x1F)) >> (m_shift & 0x1F);
-            
-            outputs[i + 1] = r_mid - side_res;
-            
-            m_inner.updateRight(r_mid); // Update weights uses r_mid, not out_right!
+    int shift = (int)(m_shift & 0x1f);
+    for (uint32_t i = 0; i < num_samples; i += 2) {
+        m_sample_counter--;
+        if (m_sample_counter == 0) {
+            if (m_progress_cb) m_progress_cb(static_cast<double>(i) / num_samples);
+            m_sample_counter = 0xac44;
         }
+
+        // left
+        int32_t res = outputs[i];
+        int32_t pr  = (int32_t)std::lrint(m_inner.predictLeft());
+        int32_t cl  = std::max(m_left_min, std::min(pr, m_left_max));
+        int32_t v   = ((cl + res) << shift) >> shift;
+        outputs[i] = v;
+        m_inner.updateLeft((double)v);
+
+        // right
+        res = outputs[i + 1];
+        pr  = (int32_t)std::lrint(m_inner.predictRight());
+        int32_t cr = std::max(m_right_min, std::min(pr, m_right_max));
+        v = ((cr + res) << shift) >> shift;
+        outputs[i + 1] = v;
+        m_inner.updateRight((double)v);
     }
 }
 
@@ -654,80 +626,62 @@ void OFR_PredictorStereo_Inner::solveCholeskyLeft() {
     int left_order = m_left_order;
     
     if (m_count_left < 48000) {
-        int p = (m_count_left - 1) - left_order;
         double dVar19 = 1.0;
-        if (p != 0) {
-            dVar19 = std::pow(m_weight, p);
-        }
-        
-        if (left_order > 0) {
-            double* h = m_left_hist_ptr;
-            m_temp_matrix[0][0] = (m_R_left[0] - h[0] * h[0]) * inv_w + m_left_matrix[0][0] * dVar19;
-            for (int i = 0; i < left_order - 1; ++i) {
-                m_left_coefs[i] = m_R_left[i * 2 + 2];
-                m_temp_matrix[i + 1][0] = (m_R_left[i * 2 + 2] - h[0] * h[i + 1]) * inv_w + m_left_matrix[i + 1][0] * dVar19;
-                for (int j = 0; j <= i; ++j) {
-                    m_temp_matrix[i + 1][j + 1] = (m_temp_matrix[i][j] - h[j + 1] * h[i + 1]) * inv_w + m_left_matrix[i + 1][j + 1] * dVar19;
-                }
+        {
+            double base = m_weight;
+            for (uint32_t e = (uint32_t)((m_count_left - left_order) - 1); e != 0; e >>= 1) {
+                if (e & 1) dVar19 *= base;
+                base *= base;
             }
-            m_left_coefs[left_order - 1] = m_R_left[(left_order - 1) * 2 + 2];
         }
-        
-        if (left_order < m_max_order) {
-            double* hl = m_left_hist_ptr;
-            double* hr = m_right_hist_ptr;
-            for (int i = left_order; i < m_max_order; ++i) {
-                m_temp_matrix[i][0] = (m_R_left[i * 2] - hl[0] * hr[i - left_order]) * inv_w + m_left_matrix[i][0] * dVar19;
-                for (int j = 0; j < left_order - 1; ++j) {
-                    m_temp_matrix[i][j + 1] = (m_temp_matrix[i - 1][j] - hl[j + 1] * hr[i - left_order]) * inv_w + m_left_matrix[i][j + 1] * dVar19;
-                }
-                m_temp_matrix[i][left_order] = m_R_left[i * 2 + 1];
-                for (int j = left_order + 1; j <= i; ++j) {
-                    m_temp_matrix[i][j] = (m_temp_matrix[i - 1][j - 1] - hr[i - left_order] * hr[j - left_order - 1]) * inv_w + m_left_matrix[i][j] * dVar19;
-                }
-                m_left_coefs[i] = m_R_left[i * 2 + 2];
+
+        const double dp = dVar19, iw = inv_w;
+        const int L = left_order, N = m_max_order;
+        double* hl = m_left_hist_ptr;
+        double* hr = m_right_hist_ptr;
+        for (int i = 0; i < L; ++i) {
+            m_temp_matrix[i][0] = m_left_matrix[i][0] * dp + (m_R_left[i*2] - hl[0]*hl[i]) * iw;
+            for (int j = 1; j <= i; ++j)
+                m_temp_matrix[i][j] = m_left_matrix[i][j] * dp + (m_temp_matrix[i-1][j-1] - hl[j]*hl[i]) * iw;
+            m_left_coefs[i] = m_R_left[i*2+2];
+            m_temp_matrix[L][i] = m_R_left[i*2+1];
+        }
+        for (int i = L; i < N; ++i) {
+            if (i > L) {
+                m_temp_matrix[i][0] = m_left_matrix[i][0] * dp + (m_R_left[i*2] - hl[0]*hr[(i-1)-L]) * iw;
+                for (int j = 1; j < L; ++j)
+                    m_temp_matrix[i][j] = m_left_matrix[i][j] * dp + (m_temp_matrix[i-1][j-1] - hl[j]*hr[(i-1)-L]) * iw;
             }
+            m_temp_matrix[i][L] = m_R_left[i*2+1];
+            for (int j = L+1; j <= i; ++j)
+                m_temp_matrix[i][j] = m_left_matrix[i][j] * dp + (m_temp_matrix[i-1][j-1] - hr[(i-1)-L]*hr[(j-1)-L]) * iw;
+            m_left_coefs[i] = m_R_left[i*2+2];
         }
     } else {
-        if (left_order > 0) {
-            double* h = m_left_hist_ptr;
-            m_temp_matrix[0][0] = (m_R_left[0] - h[0] * h[0]) * inv_w;
-            for (int i = 0; i < left_order - 1; ++i) {
-                m_left_coefs[i] = m_R_left[i * 2 + 2];
-                m_temp_matrix[i + 1][0] = (m_R_left[i * 2 + 2] - h[0] * h[i + 1]) * inv_w;
-                for (int j = 0; j <= i; ++j) {
-                    m_temp_matrix[i + 1][j + 1] = (m_temp_matrix[i][j] - h[j + 1] * h[i + 1]) * inv_w;
-                }
-            }
-            m_left_coefs[left_order - 1] = m_R_left[(left_order - 1) * 2 + 2];
+        const double iw = inv_w;
+        const int L = left_order, N = m_max_order;
+        double* hl = m_left_hist_ptr;
+        double* hr = m_right_hist_ptr;
+        for (int i = 0; i < L; ++i) {
+            m_temp_matrix[i][0] = (m_R_left[i*2] - hl[0]*hl[i]) * iw;
+            for (int j = 1; j <= i; ++j)
+                m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hl[j]*hl[i]) * iw;
+            m_left_coefs[i] = m_R_left[i*2+2];
+            m_temp_matrix[L][i] = m_R_left[i*2+1];
         }
-        
-        if (left_order < m_max_order) {
-            double* hl = m_left_hist_ptr;
-            double* hr = m_right_hist_ptr;
-            for (int i = left_order; i < m_max_order; ++i) {
-                m_temp_matrix[i][0] = (m_R_left[i * 2] - hl[0] * hr[i - left_order]) * inv_w;
-                for (int j = 0; j < left_order - 1; ++j) {
-                    m_temp_matrix[i][j + 1] = (m_temp_matrix[i - 1][j] - hl[j + 1] * hr[i - left_order]) * inv_w;
-                }
-                m_temp_matrix[i][left_order] = m_R_left[i * 2 + 1];
-                for (int j = left_order + 1; j <= i; ++j) {
-                    m_temp_matrix[i][j] = (m_temp_matrix[i - 1][j - 1] - hr[i - left_order] * hr[j - left_order - 1]) * inv_w;
-                }
-                m_left_coefs[i] = m_R_left[i * 2 + 2];
+        for (int i = L; i < N; ++i) {
+            if (i > L) {
+                m_temp_matrix[i][0] = (m_R_left[i*2] - hl[0]*hr[(i-1)-L]) * iw;
+                for (int j = 1; j < L; ++j)
+                    m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hl[j]*hr[(i-1)-L]) * iw;
             }
+            m_temp_matrix[i][L] = m_R_left[i*2+1];
+            for (int j = L+1; j <= i; ++j)
+                m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hr[(i-1)-L]*hr[(j-1)-L]) * iw;
+            m_left_coefs[i] = m_R_left[i*2+2];
         }
     }
-    
-    if (m_count_left == 137) {
-        for(int i=0; i<m_max_order; i++) {
-            for(int j=0; j<=i; j++) {
-            }
-        }
-    }
-    for (int i = 0; i < m_max_order; i++) {
-        m_left_coefs[i] = m_temp_vector[i];
-    }
+
     if (!OFR_SolveLDLT(&m_temp_matrix[0][0], m_left_coefs, m_temp_vector, m_max_order)) {
         m_is_cholesky_fail_left = 1;
         m_left_coefs[0] = 1.0;
@@ -737,9 +691,6 @@ void OFR_PredictorStereo_Inner::solveCholeskyLeft() {
             }
         }
     }
-    if (m_count_left == 137) {
-    }
-
 }
 
 void OFR_PredictorStereo_Inner::solveCholeskyRight() {
@@ -758,74 +709,62 @@ void OFR_PredictorStereo_Inner::solveCholeskyRight() {
     int left_order = m_left_order;
     
     if (m_count_right < 48000) {
-        int p = (m_count_right - 1) - left_order;
         double dVar19 = 1.0;
-        if (p != 0) {
-            dVar19 = std::pow(m_weight, p);
-        }
-        
-        if (left_order > 0) {
-            double* h = m_right_hist_ptr;
-            m_temp_matrix[0][0] = (m_R_right[0] - h[0] * h[0]) * inv_w + m_right_matrix[0][0] * dVar19;
-            for (int i = 0; i < left_order - 1; ++i) {
-                m_right_coefs[i] = m_R_right[i * 2 + 2];
-                m_temp_matrix[i + 1][0] = (m_R_right[i * 2 + 2] - h[0] * h[i + 1]) * inv_w + m_right_matrix[i + 1][0] * dVar19;
-                for (int j = 0; j <= i; ++j) {
-                    m_temp_matrix[i + 1][j + 1] = (m_temp_matrix[i][j] - h[j + 1] * h[i + 1]) * inv_w + m_right_matrix[i + 1][j + 1] * dVar19;
-                }
+        {
+            double base = m_weight;
+            for (uint32_t e = (uint32_t)((m_count_right - left_order) - 1); e != 0; e >>= 1) {
+                if (e & 1) dVar19 *= base;
+                base *= base;
             }
-            m_right_coefs[left_order - 1] = m_R_right[(left_order - 1) * 2 + 2];
         }
-        
-        if (left_order < m_max_order) {
-            double* hr = m_right_hist_ptr;
-            double* hl = m_left_hist_ptr;
-            for (int i = left_order; i < m_max_order; ++i) {
-                m_temp_matrix[i][0] = (m_R_right[i * 2] - hr[0] * hl[i - left_order]) * inv_w + m_right_matrix[i][0] * dVar19;
-                for (int j = 0; j < left_order - 1; ++j) {
-                    m_temp_matrix[i][j + 1] = (m_temp_matrix[i - 1][j] - hr[j + 1] * hl[i - left_order]) * inv_w + m_right_matrix[i][j + 1] * dVar19;
-                }
-                m_temp_matrix[i][left_order] = m_R_right[i * 2 + 1];
-                for (int j = left_order + 1; j <= i; ++j) {
-                    m_temp_matrix[i][j] = (m_temp_matrix[i - 1][j - 1] - hl[i - left_order] * hl[j - left_order - 1]) * inv_w + m_right_matrix[i][j] * dVar19;
-                }
-                m_right_coefs[i] = m_R_right[i * 2 + 2];
+
+        const double dp = dVar19, iw = inv_w;
+        const int L = left_order, N = m_max_order;
+        double* hr = m_right_hist_ptr;
+        double* hl = m_left_hist_ptr;
+        for (int i = 0; i < L; ++i) {
+            m_temp_matrix[i][0] = m_right_matrix[i][0] * dp + (m_R_right[i*2] - hr[0]*hr[i]) * iw;
+            for (int j = 1; j <= i; ++j)
+                m_temp_matrix[i][j] = m_right_matrix[i][j] * dp + (m_temp_matrix[i-1][j-1] - hr[j]*hr[i]) * iw;
+            m_right_coefs[i] = m_R_right[i*2+2];
+            m_temp_matrix[L][i] = m_R_right[i*2+1];
+        }
+        for (int i = L; i < N; ++i) {
+            if (i > L) {
+                m_temp_matrix[i][0] = m_right_matrix[i][0] * dp + (m_R_right[i*2] - hr[0]*hl[(i-1)-L]) * iw;
+                for (int j = 1; j < L; ++j)
+                    m_temp_matrix[i][j] = m_right_matrix[i][j] * dp + (m_temp_matrix[i-1][j-1] - hr[j]*hl[(i-1)-L]) * iw;
             }
+            m_temp_matrix[i][L] = m_R_right[i*2+1];
+            for (int j = L+1; j <= i; ++j)
+                m_temp_matrix[i][j] = m_right_matrix[i][j] * dp + (m_temp_matrix[i-1][j-1] - hl[(i-1)-L]*hl[(j-1)-L]) * iw;
+            m_right_coefs[i] = m_R_right[i*2+2];
         }
     } else {
-        if (left_order > 0) {
-            double* h = m_right_hist_ptr;
-            m_temp_matrix[0][0] = (m_R_right[0] - h[0] * h[0]) * inv_w;
-            for (int i = 0; i < left_order - 1; ++i) {
-                m_right_coefs[i] = m_R_right[i * 2 + 2];
-                m_temp_matrix[i + 1][0] = (m_R_right[i * 2 + 2] - h[0] * h[i + 1]) * inv_w;
-                for (int j = 0; j <= i; ++j) {
-                    m_temp_matrix[i + 1][j + 1] = (m_temp_matrix[i][j] - h[j + 1] * h[i + 1]) * inv_w;
-                }
-            }
-            m_right_coefs[left_order - 1] = m_R_right[(left_order - 1) * 2 + 2];
+        const double iw = inv_w;
+        const int L = left_order, N = m_max_order;
+        double* hr = m_right_hist_ptr;
+        double* hl = m_left_hist_ptr;
+        for (int i = 0; i < L; ++i) {
+            m_temp_matrix[i][0] = (m_R_right[i*2] - hr[0]*hr[i]) * iw;
+            for (int j = 1; j <= i; ++j)
+                m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hr[j]*hr[i]) * iw;
+            m_right_coefs[i] = m_R_right[i*2+2];
+            m_temp_matrix[L][i] = m_R_right[i*2+1];
         }
-        
-        if (left_order < m_max_order) {
-            double* hr = m_right_hist_ptr;
-            double* hl = m_left_hist_ptr;
-            for (int i = left_order; i < m_max_order; ++i) {
-                m_temp_matrix[i][0] = (m_R_right[i * 2] - hr[0] * hl[i - left_order]) * inv_w;
-                for (int j = 0; j < left_order - 1; ++j) {
-                    m_temp_matrix[i][j + 1] = (m_temp_matrix[i - 1][j] - hr[j + 1] * hl[i - left_order]) * inv_w;
-                }
-                m_temp_matrix[i][left_order] = m_R_right[i * 2 + 1];
-                for (int j = left_order + 1; j <= i; ++j) {
-                    m_temp_matrix[i][j] = (m_temp_matrix[i - 1][j - 1] - hl[i - left_order] * hl[j - left_order - 1]) * inv_w;
-                }
-                m_right_coefs[i] = m_R_right[i * 2 + 2];
+        for (int i = L; i < N; ++i) {
+            if (i > L) {
+                m_temp_matrix[i][0] = (m_R_right[i*2] - hr[0]*hl[(i-1)-L]) * iw;
+                for (int j = 1; j < L; ++j)
+                    m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hr[j]*hl[(i-1)-L]) * iw;
             }
+            m_temp_matrix[i][L] = m_R_right[i*2+1];
+            for (int j = L+1; j <= i; ++j)
+                m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hl[(i-1)-L]*hl[(j-1)-L]) * iw;
+            m_right_coefs[i] = m_R_right[i*2+2];
         }
     }
-    
-    for (int i = 0; i < m_max_order; i++) {
-        m_right_coefs[i] = m_temp_vector[i];
-    }
+
     if (!OFR_SolveLDLT(&m_temp_matrix[0][0], m_right_coefs, m_temp_vector, m_max_order)) {
         m_is_cholesky_fail_right = 1;
         m_right_coefs[0] = 1.0;
@@ -840,7 +779,7 @@ void OFR_PredictorStereo_Inner::solveCholeskyRight() {
 void OFR_PredictorStereo_Inner::updateLeft(double sample) {
     if (m_left_hist_ptr == &m_left_history[0]) {
         if (m_left_order > 0) {
-            for (int i = 0; i < m_left_order - 1; ++i) {
+            for (int i = 0; i < m_left_order; ++i) {
                 m_left_history[1024 - m_left_order + i] = m_left_history[i];
             }
         }
@@ -856,7 +795,7 @@ void OFR_PredictorStereo_Inner::updateLeft(double sample) {
             if (m_left_order > 0) {
                 for (int i = 0; i < m_left_order; ++i) {
                     for (int j = 0; j <= i; ++j) {
-                        m_left_matrix[i][j] = m_left_hist_ptr[j] * m_left_hist_ptr[i];
+                        m_left_matrix[i][j] = m_left_hist_ptr[j + 1] * m_left_hist_ptr[i + 1];
                     }
                 }
             }
@@ -865,11 +804,11 @@ void OFR_PredictorStereo_Inner::updateLeft(double sample) {
                     int right_idx = i - m_left_order;
                     if (m_left_order > 0) {
                         for (int j = 0; j < m_left_order; ++j) {
-                            m_left_matrix[i][j] = m_right_hist_ptr[right_idx] * m_left_hist_ptr[j];
+                            m_left_matrix[i][j] = m_right_hist_ptr[right_idx] * m_left_hist_ptr[j + 1];
                         }
                     }
                     for (int j = m_left_order + 1; j <= i; ++j) {
-                        m_left_matrix[i][j] = m_right_hist_ptr[m_count_left - m_left_order + (j - m_left_order - 1)] * m_right_hist_ptr[right_idx];
+                        m_left_matrix[i][j] = m_right_hist_ptr[j - m_left_order] * m_right_hist_ptr[right_idx];
                     }
                 }
             }
@@ -891,7 +830,7 @@ void OFR_PredictorStereo_Inner::updateLeft(double sample) {
 void OFR_PredictorStereo_Inner::updateRight(double sample) {
     if (m_right_hist_ptr == &m_right_history[0]) {
         if (m_left_order > 0) {
-            for (int i = 0; i < m_left_order - 1; ++i) {
+            for (int i = 0; i < m_left_order; ++i) {
                 m_right_history[1024 - m_left_order + i] = m_right_history[i];
             }
         }
@@ -907,7 +846,7 @@ void OFR_PredictorStereo_Inner::updateRight(double sample) {
             if (m_left_order > 0) {
                 for (int i = 0; i < m_left_order; ++i) {
                     for (int j = 0; j <= i; ++j) {
-                        m_right_matrix[i][j] = m_right_hist_ptr[j] * m_right_hist_ptr[i];
+                        m_right_matrix[i][j] = m_right_hist_ptr[j + 1] * m_right_hist_ptr[i + 1];
                     }
                 }
             }
@@ -916,11 +855,11 @@ void OFR_PredictorStereo_Inner::updateRight(double sample) {
                     int right_idx = i - m_left_order;
                     if (m_left_order > 0) {
                         for (int j = 0; j < m_left_order; ++j) {
-                            m_right_matrix[i][j] = m_left_hist_ptr[right_idx] * m_right_hist_ptr[j];
+                            m_right_matrix[i][j] = m_left_hist_ptr[right_idx] * m_right_hist_ptr[j + 1];
                         }
                     }
                     for (int j = m_left_order + 1; j <= i; ++j) {
-                        m_right_matrix[i][j] = m_left_hist_ptr[m_count_right - m_left_order + (j - m_left_order - 1)] * m_left_hist_ptr[right_idx];
+                        m_right_matrix[i][j] = m_left_hist_ptr[j - m_left_order] * m_left_hist_ptr[right_idx];
                     }
                 }
             }
@@ -969,6 +908,7 @@ void OFR_PredictorStereo::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
 }
 
 void OFR_PostProcessor::init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t channels) {
+    m_channels = channels;
     auto sign_extend = [](uint32_t val, uint32_t bits) -> int32_t {
         uint32_t shift = 32 - bits;
         return ((int32_t)(val << shift)) >> shift;

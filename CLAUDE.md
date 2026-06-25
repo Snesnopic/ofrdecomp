@@ -81,13 +81,19 @@ The COMP block's "2 bytes reserved" word encodes `pred=(w>>6)&0x1f, ent=w>>11, p
 
 ## Test status (preset matrix, 16-bit, realistic non-tonal sources)
 
-**`pred_type=1` AND `pred_type=3` complete, mono+stereo** (presets 0-10). 22/24 preset×channel pass.
+**ALL standard presets bit-exact, mono+stereo (0-10 AND max): 24/24.**
 
 | Combo | Status |
 |---|---|
 | pred=1, ent∈{1,2}, post∈{1,2}, mono+stereo (presets 0-3) | PASS bit-exact |
 | pred=3 mono+stereo (presets 4-10) | PASS bit-exact (cascade NLMS, `optimfrog_decoder_pred3.cpp`) |
-| preset max (entropy_type=3) mono+stereo | FAIL — entropy_type=3 not implemented |
+| entropy_type=3 "acm" (preset max) mono+stereo | PASS bit-exact (`optimfrog_decoder_ent3.cpp`) |
+
+### entropy_type=3 note (acm, all integer)
+Context-modeling entropy: 9×9 Markov over bit-length "states" (per-channel +0x58) + value contexts
+selected by the exponent of an 8-tap exponentially-smoothed magnitude (`hist[i] += (v<<16 - hist[i])>>(3+i)`).
+Per-context k/num_symbols/scale read at init (`FUN_00004c00`); per-sample decode `FUN_00006100`.
+Reuses the same adaptive-tree contexts as the fast entropy. See `doc/ent3_analysis.md`.
 
 ### pred_type=3 stereo note
 Reuses `OFR_PredictorStereo_Inner` (main) + two **cross-channel** cascades sharing two per-stage error
@@ -113,10 +119,10 @@ transform flag `obj+0x9a`==1 — triggered by tonal/synthetic signals (pure sine
 
 ## Next work (ordered by cost)
 
-1. **entropy_type=3** (preset max, "acm") — the only remaining decode path for the standard presets.
-   Both mono and stereo `max` use it (paired with pred=3).
-2. **post_type=2 value-remap table** (`FUN_00017f00`/`FUN_00018cb0`) — only for tonal/synthetic signals.
-3. Encoder (not started).
+1. **post_type=2 value-remap table** (`FUN_00017f00`/`FUN_00018cb0`) — the ONLY remaining decode gap.
+   Only activates when the transform flag `obj+0x9a`==1 (tonal/synthetic signals: pure sine, ramp).
+   NOT triggered by real audio, so 24/24 standard presets already pass on realistic sources.
+2. Encoder (not started).
 
 ## Recent fixes (this session)
 - entropy path selection by `type==1 && channels==2` (was `is_fast_stereo`) → ent=2 stereo works.

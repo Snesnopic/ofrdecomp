@@ -502,6 +502,31 @@ public:
     void fc_solve(OFR_SubCascade& c);
 };
 
+// entropy_type=3: "acm" advanced context-modeling entropy (preset max). All integer.
+// See doc/ent3_analysis.md.
+class OFR_EntropyAcm {
+public:
+    struct Ctx { std::vector<uint32_t> freqs; uint32_t num_symbols=0, total_freq=0, limit=0, num_nodes=0; };
+    struct Chan {
+        bool msb_flag=false;
+        uint32_t reset=0, state=0, countdown=0;
+        int64_t hist[8] = {0,0,0,0,0,0,0,0};
+        std::vector<Ctx> bitlen;            // +0x58: 9 ctxs of 9 symbols
+        std::vector<Ctx> vctx;              // +0x70: value contexts
+        std::vector<int> vmap;              // +0x370: exponent -> ctx index
+        std::vector<uint32_t> k;            // +0x3f0
+        std::vector<uint32_t> nsym;         // +0x470
+        std::vector<uint32_t> transform;    // +0x4f0
+        std::vector<uint32_t> scale;        // +0x570
+    };
+    uint32_t bit_depth=0, channels=0, total_samples=0;
+    std::vector<Chan> chans;
+    bool needs_init=false;
+    void init(OFR_RangeCoder* rc, uint32_t bd, uint32_t ch, uint32_t total);
+    void decode_block(int32_t* dest, uint32_t count, OFR_RangeCoder* rc);
+    uint32_t decode_sample(Chan& c, OFR_RangeCoder* rc);
+};
+
 class OFR_PostProcessor {
 public:
     void init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t channels);
@@ -543,12 +568,14 @@ public:
     OFR_PredictorStereo* predictor_stereo;
     OFR_PredictorCascadeMono* predictor_cascade_mono;
     OFR_PredictorCascadeStereo* predictor_cascade_stereo;
+    OFR_EntropyAcm* entropy_acm;
     OFR_PostProcessor* post_processor;
 
-    OFR_BlockDecoder() : entropy(nullptr), predictor(nullptr), predictor_fast_stereo(nullptr), predictor_stereo(nullptr), predictor_cascade_mono(nullptr), predictor_cascade_stereo(nullptr), post_processor(nullptr) {}
+    OFR_BlockDecoder() : entropy(nullptr), predictor(nullptr), predictor_fast_stereo(nullptr), predictor_stereo(nullptr), predictor_cascade_mono(nullptr), predictor_cascade_stereo(nullptr), entropy_acm(nullptr), post_processor(nullptr) {}
 
     void decode_block(uint32_t* dest, uint32_t count, OFR_RangeCoder* rc) {
         if (entropy) entropy->decode_block((int32_t*)dest, count, rc);
+        if (entropy_acm) entropy_acm->decode_block((int32_t*)dest, count, rc);
         if (predictor) {
             predictor->decode((int*)dest, count);
 

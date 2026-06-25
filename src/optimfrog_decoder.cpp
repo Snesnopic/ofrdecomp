@@ -250,7 +250,13 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             }
 
             // Entropy Coder
-            if (entropy_type != 0) {
+            if (entropy_type == 3) {
+                if (!this->block_decoder.entropy_acm) {
+                    this->block_decoder.entropy_acm = new OFR_EntropyAcm();
+                }
+                this->block_decoder.entropy_acm->init(&this->range_coder,
+                    (uint32_t)data_bits, this->channels, uncompressed_size);
+            } else if (entropy_type != 0) {
                 if (!this->block_decoder.entropy) {
                     this->block_decoder.entropy = new OFR_EntropyDecoder();
                     this->block_decoder.entropy->init((uint32_t)data_bits, this->channels, entropy_type, true);

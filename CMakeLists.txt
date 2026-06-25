@@ -13,6 +13,7 @@ add_library(optimfrogcpp_lib
     src/optimfrog_decoder_entropy.cpp
     src/optimfrog_decoder_predictor.cpp
     src/optimfrog_decoder_pred3.cpp
+    src/optimfrog_decoder_ent3.cpp
 )
 
 # pred3 cascade uses float32 math that must NOT be reordered/contracted by -ffast-math

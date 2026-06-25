@@ -67,9 +67,59 @@ Reference files:
 - **Stereo decode loop** (`FUN_00007440`): clamp prediction to [min,max], `((clamped+res)<<shift)>>shift`,
   update with the final value. `lrint` rounding (cvtsd2si).
 
-### Encoder
+### Encoder (in progress)
 
-- **Not started.** Decoder is the only thing implemented.
+Strategy: a lossless codec shares the adaptive models between encoder and decoder — the encoder
+just runs them forward (`residual = x - clamp(predict())`, then `update(x)`, the SAME update as
+decode). So REUSE the decoder predictor/entropy/context models and write only: (1) the range
+*encoder* (dual of the range decoder), (2) header/COMP writer, (3) parameter selection. The chosen
+params are written into the bitstream and read back by the decoder — they need NOT match the
+reference encoder's choices, only be valid and self-consistent.
+
+- **Range encoder DONE + verified** (`include/optimfrog_encoder.h`, `OFR_RangeEncoder`): exact dual
+  of `OFR_RangeCoder`. 31-bit window (decoder's post-init range is 0x80000000 due to the 7-bit init +
+  byte renorm at 0x800001), carry-counting byte emission (cache + run-of-0xFF), first emitted byte is
+  the dummy `b0` the decoder ignores. Implements `encode_uniform`, `encode_bits`/`encode_bits_internal`
+  (LSB-first 12-bit chunks), `encode_split`, `encode_symbol` (dual of `decode_symbol`: replicate the
+  exact tree walk + freq +2 updates by navigating the path bits of `num_nodes+sym`), `encode_golomb`
+  (note: this golomb never emits 1 — values are 0,2,3,4,…), `flush` (5× shift_low).
+- **Round-trip test**: `src/enc_rt_test.cpp` — encode 300k mixed ops, decode with the real
+  `OFR_RangeCoder` + parallel `OFR_ModelContext`, **0 mismatches**. Build:
+  `clang++ -std=c++17 -O2 -Iinclude src/enc_rt_test.cpp build/liboptimfrogcpp_lib.a -o /tmp/enc_rt`.
+- `ofr` (the official CLI encoder) imported into Ghidra (stripped, statically linked, ~107 fns found
+  by auto-analysis — incomplete). Not the primary source; the decoder format IS the spec.
+
+- **WORKING mono + stereo encoder** (`src/optimfrog_encoder.cpp`, `ofr_encode_mono16` /
+  `ofr_encode_stereo16` + `ofrenc` CLI): 16-bit, pred=1 / ent=1 (fast) / post=1 (identity). Output is
+  **bit-exact lossless** when decoded by BOTH our decoder and the **official reference decoder**
+  (`/tmp/ref_gen`), verified on diverse signals (sine, music, white noise, full-range), mono AND stereo.
+  Compression ≈ reference preset 0–2. Build: `cmake --build build` →
+  `build/ofrenc in.raw out.ofr rate [channels]`.
+  - **Stereo**: `total_samples` and COMP `numSamples` are in VALUES (frames×channels), channelConfig=1.
+    Reuses `OFR_PredictorStereo_Inner` (predictLeft/updateLeft/predictRight/updateRight, lrint rounding,
+    clamp per channel). The order **table index** sets BOTH max_order (`DAT_00326220`) and right_order
+    (`DAT_00326200`); left_order = max-right. Fast stereo entropy = same contexts (shared) with two
+    interleaved variances var_L/var_R. Stereo init reads weight via `bits(12)` (not read_12bit_value).
+  - File layout (mirrors a real `ofr --raw` file, see hexdump RE): `OFR ` main(S=17) + `HEAD`(0) +
+    `COMP` + `TAIL`(0). COMP = D(4) + **CRC32**(4, zlib over the D-4 bytes) + numSamples(4) + type(1)
+    + cfg(1) + reserved(2 = ent<<11|pred<<6|post) + 1 encoderID byte (decoder skips it) + range stream
+    (whose dummy `b0` doubles as the 2nd encoderID byte). D = 13 + len(range_out).
+  - post=1 init dual: `split(16,min)`, `split(16,max)`, `bits(1,0)` (identity mult/offset). bit_depth
+    here = bitspersample(16), NOT data_bits.
+  - predictor init dual: `uniform(4096, W-2)` + interval **table index** `bits(3,idx)` + order **table
+    index** `bits(5,idx)`. **Use table indices, NOT the escape** — the order/interval escape path
+    desyncs vs the reference. Residual = `((sample - clamp(round(predict()))) << sh) >> sh` (wrap to
+    data_bits, sh=(32-data_bits)&0x1f), then `update(sample)`. Reuses `OFR_Predictor`.
+  - entropy init dual: `uniform(4096, w-2)` (read_12bit_value dual) → weight=(w-1)/w, weight2=1/w.
+    Fast entropy encoder = exact dual of `fast_decode_sample`: zigzag(residual) → symbol/group/extra,
+    tree walk + freq +2, var update. Contexts sized by data_bits (`num_contexts=2*data_bits`,
+    `per_symbols=data_bits<4?1<<d:d*8-0x10`).
+  - **MONO order up to ~96** (reliable, bit-exact vs reference). Since the faithful mono weight-update
+    port (below), high-order mono decodes losslessly on the reference. Default order=64 ≈ preset 4
+    (beats it on music). Orders ≥192 still desync (other high-order path, not chased). **STEREO still
+    order ≤ 24** — the stereo Cholesky solver is not yet a faithful port.
+- **Next encoder steps**: faithful stereo Cholesky port (unlocks high-order stereo + stereo ramp) →
+  per-block param selection → ent=2/3 duals → pred=3 → 8/24-bit sample types.
 
 ## Test infrastructure (reference encoder available!)
 
@@ -114,15 +164,34 @@ fires at counter = halve_interval + that field (NOT at halve_interval). Same fie
   exp-weighted covariance M + cross-corr V; `FUN_00015570` periodically re-solves via `FUN_000152c0`,
   an LDLT with row stride 8, diag threshold 2^-17, energy gate V[0]>=0.5).
 
-Remaining pred=1 gap: **post_type=2 value-remap table** (`FUN_00017f00`/`FUN_00018cb0`), only active when the
-transform flag `obj+0x9a`==1 — triggered by tonal/synthetic signals (pure sine, ramp), NOT real audio.
+post_type=2 value-remap table (`FUN_00017f00`/`FUN_000189f0`, `optimfrog_decoder_post2.cpp`):
+**implemented**. Active only when the per-channel transform flag is set (tonal/synthetic signals).
+
+## Decoder coverage — MONO 100% (perfect-ramp gap CLOSED), stereo ramp/square remain
+
+**Mono is now bit-exact on EVERYTHING**, including the pathological perfect ramp: ramp 12/12,
+silence 12/12, square 12/12 (mono, all presets) + 24/24 real + 24/24 sine. The perfect-ramp
+singular-covariance gap — long the only documented un-closed case — is **CLOSED for mono**.
+
+How it was closed (the recipe): the mono weight-update + LDLT must be bit-for-bit faithful to the
+binary AND not reordered by the compiler:
+1. `solve_ldlt` = exact `FUN_00012ca0` port (in-place stride structure, `m[i][k]*diag[k]*m[j][k]`
+   inner order, separate `d -= m[i][k]²*diag[k]` loop using the stored normalized value, threshold 2^-17).
+2. `update_weights` damp_pow = `damping^(sample_count-order-1)` via **exp-by-squaring** (NOT std::pow),
+   energy gate `R[0] >= 0.5` (DAT_19770).
+3. **`optimfrog_decoder_predictor.cpp` compiled `-fno-fast-math -ffp-contract=off`** (CMakeLists) — the
+   binary is -fno-fast-math; without this the careful op-ordering gets reordered and the near-singular
+   ramp diverges by 1 ULP. THIS was the missing piece on prior attempts.
+
+**Remaining decoder gap:** stereo perfect-ramp / square (pred=1 stereo uses the Cholesky solver
+`solveCholeskyLeft/Right`, pred=3 stereo the cascade combiner — neither is a faithful port yet, so they
+still diverge by 1 ULP on singular covariances). Stereo real audio + sine remain 24/24. Closing it =
+apply the same faithful-port + no-fast-math recipe to the stereo Cholesky solver.
 
 ## Next work (ordered by cost)
 
-1. **post_type=2 value-remap table** (`FUN_00017f00`/`FUN_00018cb0`) — the ONLY remaining decode gap.
-   Only activates when the transform flag `obj+0x9a`==1 (tonal/synthetic signals: pure sine, ramp).
-   NOT triggered by real audio, so 24/24 standard presets already pass on realistic sources.
-2. Encoder (not started).
+1. **Encoder** (in progress) — mono high-order done; next stereo high-order + ent=2/3 + pred=3.
+2. *(for 100% formal coverage)* faithful stereo Cholesky port → closes stereo ramp/square.
 
 ## Recent fixes (this session)
 - entropy path selection by `type==1 && channels==2` (was `is_fast_stereo`) → ent=2 stereo works.

@@ -73,48 +73,50 @@ void OFR_Predictor::update_cov_1() {
 }
 
 bool OFR_Predictor::solve_ldlt() {
-    for (int i = 0; i < order; i++) {
+    // faithful port of FUN_00012ca0 (in-place LDLT, stride-128, threshold 2^-17, exact float op order)
+    const double thr = 7.62939453125e-06; // 2^-17
+    double d0 = cov_matrix[0][0];
+    temp_D[0] = d0;
+    if (std::abs(d0) < thr) return false;
+    cov_matrix[0][0] = 1.0;
+    for (int i = 1; i < order; i++) {
+        for (int j = 0; j < i; j++) {
+            double v = cov_matrix[i][j];
+            for (int k = 0; k < j; k++) v -= cov_matrix[i][k] * temp_D[k] * cov_matrix[j][k];
+            cov_matrix[i][j] = v / temp_D[j];
+        }
         double d = cov_matrix[i][i];
-        for (int j = 0; j < i; j++) {
-            double l_ij = cov_matrix[i][j];
-            for (int k = 0; k < j; k++) {
-                l_ij -= cov_matrix[i][k] * cov_matrix[j][k] * temp_D[k];
-            }
-            cov_matrix[i][j] = l_ij / temp_D[j];
-            d -= l_ij * l_ij / temp_D[j];
-        }
+        cov_matrix[i][i] = 1.0;
+        for (int k = 0; k < i; k++) d -= cov_matrix[i][k] * cov_matrix[i][k] * temp_D[k];
         temp_D[i] = d;
-        if (std::abs(d) < 1e-10) return false;
+        if (std::abs(d) < thr) return false;
     }
-    
-    for (int i = 0; i < order; i++) {
-        double y = weights[i];
-        for (int j = 0; j < i; j++) {
-            y -= cov_matrix[i][j] * weights[j];
-        }
-        weights[i] = y;
+    // forward substitution
+    for (int i = 1; i < order; i++) {
+        double v = weights[i];
+        for (int k = 0; k < i; k++) v -= cov_matrix[i][k] * weights[k];
+        weights[i] = v;
     }
-    
-    for (int i = order - 1; i >= 0; i--) {
-        double w = weights[i] / temp_D[i];
-        for (int j = i + 1; j < order; j++) {
-            w -= cov_matrix[j][i] * weights[j];
-        }
-        weights[i] = w;
+    // back substitution
+    weights[order - 1] = weights[order - 1] / temp_D[order - 1];
+    for (int i = order - 2; i >= 0; i--) {
+        double v = weights[i] / temp_D[i];
+        for (int k = i + 1; k < order; k++) v -= cov_matrix[k][i] * weights[k];
+        weights[i] = v;
     }
-    
     return true;
 }
 
 void OFR_Predictor::update_weights() {
     double vR0 = vector_R[0];
-    if (vR0 >= 1e-10) {
+    if (vR0 >= 0.5) {   // DAT_19770 energy gate (FUN_00014e30)
         double damping_inv = 1.0 / damping;
-        
+
         if (sample_count < 48000) {
-            int exponent = (sample_count - 1) - order;
-            double damp_pow = 1.0;
-            if (exponent != 0) damp_pow = std::pow(damping, exponent);
+            // damp_pow = damping^(sample_count-order-1) via exp-by-squaring (matches FUN_00014e30 exactly)
+            uint32_t e = sample_count - (uint32_t)order - 1u;
+            double base = damping, damp_pow = 1.0;
+            while (e != 0) { if (e & 1u) damp_pow *= base; base *= base; e >>= 1; }
             
             if (order > 0) {
                 for (int i = 0; i < order; i++) {

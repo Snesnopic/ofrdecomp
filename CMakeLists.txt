@@ -17,9 +17,15 @@ add_library(optimfrogcpp_lib
     src/optimfrog_decoder_post2.cpp
 )
 
-# pred3 cascade uses float32 math that must NOT be reordered/contracted by -ffast-math
-set_source_files_properties(src/optimfrog_decoder_pred3.cpp PROPERTIES
+# float math that must NOT be reordered/contracted by -ffast-math (bit-exactness vs the binary,
+# which was built -fno-fast-math). pred3 cascade + the mono predictor weight-update/LDLT.
+set_source_files_properties(src/optimfrog_decoder_pred3.cpp src/optimfrog_decoder_predictor.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 
 add_executable(optimfrogcpp src/main.cpp)
 target_link_libraries(optimfrogcpp optimfrogcpp_lib)
+
+# encoder CLI (mono 16-bit lossless, pred=1/ent=1/post=1)
+add_executable(ofrenc src/optimfrog_encoder.cpp)
+target_compile_definitions(ofrenc PRIVATE OFRENC_MAIN)
+target_link_libraries(ofrenc optimfrogcpp_lib)

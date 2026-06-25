@@ -565,7 +565,7 @@ bool OFR_SolveLDLT(double* matrix, double* rhs_out, double* diagonal, int size) 
     union { double d; uint64_t u; } uval;
     uval.d = d_val;
     uval.u &= abs_mask;
-    if (uval.d < 1e-15) {
+    if (uval.d < 7.62939453125e-06) {
         return false;
     }
     
@@ -594,7 +594,7 @@ bool OFR_SolveLDLT(double* matrix, double* rhs_out, double* diagonal, int size) 
             
             uval.d = d_val_i;
             uval.u &= abs_mask;
-            if (uval.d < 1e-15) {
+            if (uval.d < 7.62939453125e-06) {
                 return false;
             }
         }
@@ -622,7 +622,7 @@ bool OFR_SolveLDLT(double* matrix, double* rhs_out, double* diagonal, int size) 
 
 void OFR_PredictorStereo_Inner::solveCholeskyLeft() {
     double r0 = m_R_left[0];
-    if (r0 < 1e-7) {
+    if (r0 < 0.5) {
         m_left_coefs[0] = 1.0;
         if (m_max_order > 1) {
             for (int i = 1; i < m_max_order; ++i) {
@@ -705,7 +705,7 @@ void OFR_PredictorStereo_Inner::solveCholeskyLeft() {
 
 void OFR_PredictorStereo_Inner::solveCholeskyRight() {
     double r0 = m_R_right[0];
-    if (r0 < 1e-7) {
+    if (r0 < 0.5) {
         m_right_coefs[0] = 1.0;
         if (m_max_order > 1) {
             for (int i = 1; i < m_max_order; ++i) {

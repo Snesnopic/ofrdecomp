@@ -167,31 +167,31 @@ fires at counter = halve_interval + that field (NOT at halve_interval). Same fie
 post_type=2 value-remap table (`FUN_00017f00`/`FUN_000189f0`, `optimfrog_decoder_post2.cpp`):
 **implemented**. Active only when the per-channel transform flag is set (tonal/synthetic signals).
 
-## Decoder coverage — MONO 100% (perfect-ramp gap CLOSED), stereo ramp/square remain
+## Decoder coverage — 100% (mono AND stereo, including all pathological signals)
 
-**Mono is now bit-exact on EVERYTHING**, including the pathological perfect ramp: ramp 12/12,
-silence 12/12, square 12/12 (mono, all presets) + 24/24 real + 24/24 sine. The perfect-ramp
-singular-covariance gap — long the only documented un-closed case — is **CLOSED for mono**.
+**The decoder is now bit-exact on EVERYTHING.** The perfect-ramp singular-covariance gap — long the
+only documented un-closed case — is **CLOSED for both mono and stereo**:
+- mono ramp/silence/square: 12/12 each; stereo ramp/silence/square: 12/12 each
+- 24/24 real + 24/24 sine (mono+stereo), sine_mono + test_stereo MD5 intact
 
-How it was closed (the recipe): the mono weight-update + LDLT must be bit-for-bit faithful to the
-binary AND not reordered by the compiler:
-1. `solve_ldlt` = exact `FUN_00012ca0` port (in-place stride structure, `m[i][k]*diag[k]*m[j][k]`
-   inner order, separate `d -= m[i][k]²*diag[k]` loop using the stored normalized value, threshold 2^-17).
-2. `update_weights` damp_pow = `damping^(sample_count-order-1)` via **exp-by-squaring** (NOT std::pow),
+How it was closed (the recipe — the weight-update/solver must be bit-for-bit faithful AND not
+reordered by the compiler):
+1. **`optimfrog_decoder_predictor.cpp` compiled `-fno-fast-math -ffp-contract=off`** (CMakeLists) — the
+   binary is -fno-fast-math; without this the careful op-ordering gets reordered and near-singular
+   covariances diverge by 1 ULP. THIS was the missing piece on all prior attempts.
+2. **Mono** (`FUN_00014e30`+`FUN_00012ca0`): `solve_ldlt` = exact `FUN_00012ca0` port (in-place stride,
+   `m[i][k]*diag[k]*m[j][k]` inner order, separate `d -= m[i][k]²*diag[k]` loop on the stored
+   normalized value, threshold 2^-17); `update_weights` damp_pow via **exp-by-squaring** (not std::pow),
    energy gate `R[0] >= 0.5` (DAT_19770).
-3. **`optimfrog_decoder_predictor.cpp` compiled `-fno-fast-math -ffp-contract=off`** (CMakeLists) — the
-   binary is -fno-fast-math; without this the careful op-ordering gets reordered and the near-singular
-   ramp diverges by 1 ULP. THIS was the missing piece on prior attempts.
-
-**Remaining decoder gap:** stereo perfect-ramp / square (pred=1 stereo uses the Cholesky solver
-`solveCholeskyLeft/Right`, pred=3 stereo the cascade combiner — neither is a faithful port yet, so they
-still diverge by 1 ULP on singular covariances). Stereo real audio + sine remain 24/24. Closing it =
-apply the same faithful-port + no-fast-math recipe to the stereo Cholesky solver.
+3. **Stereo** (`FUN_00013310`/`FUN_00013bf0` → `FUN_00012ca0`): `OFR_SolveLDLT` threshold **2^-17**
+   (was 1e-15) and `solveCholeskyLeft/Right` energy gate **0.5** (was 1e-7). Those two constants +
+   the no-fast-math compile closed stereo ramp/square (the binary's two-stage singular fallback in
+   `FUN_00013310` is NOT needed in practice — correct constants alone suffice).
 
 ## Next work (ordered by cost)
 
-1. **Encoder** (in progress) — mono high-order done; next stereo high-order + ent=2/3 + pred=3.
-2. *(for 100% formal coverage)* faithful stereo Cholesky port → closes stereo ramp/square.
+1. **Encoder** (in progress) — mono high-order done; next stereo high-order (still order≤24; the
+   high-order stereo path desyncs — investigate), ent=2/3 duals, pred=3, 8/24-bit.
 
 ## Recent fixes (this session)
 - entropy path selection by `type==1 && channels==2` (was `is_fast_stereo`) → ent=2 stereo works.

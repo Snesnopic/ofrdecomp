@@ -182,6 +182,53 @@ void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, uint32_t bit_depth, int 
 
 }
 
+// encoder-side: same state setup as init() but from explicit params (no range coder reads).
+// FP-sensitive (mu, decay, fc_decay) — lives in this -fno-fast-math TU for bit-exactness.
+void OFR_PredictorCascadeMono::setup_for_encode(int mn, int mx, int dbits, int total,
+        uint32_t main_w, uint32_t main_iv, uint32_t main_od, int n_stages_,
+        double decay_, uint32_t fc_w, uint32_t fc_halve_k, uint32_t golomb_field,
+        const std::vector<int>& stage_orders, const std::vector<int>& stage_mu10,
+        const std::vector<uint8_t>& sched) {
+    min_val = mn; max_val = mx; shift = 32 - dbits; total_samples = total;
+    main_weight_param = main_w; main_interval = main_iv; main_order = main_od;
+    n_stages = n_stages_;
+    decay = decay_;
+    fc_halve_interval = 1u << fc_halve_k;
+    uint32_t fc_weight_param = fc_w;
+
+    stages.assign(n_stages + 1, OFR_CascadeStage());
+    double stage_eps = std::max({(double)std::abs(min_val), (double)std::abs(max_val), 1.0});
+    for (int s = 1; s <= n_stages; ++s) {
+        int order = stage_orders[s - 1];
+        double mu = (double)stage_mu10[s - 1] / DAT_19688;
+        OFR_CascadeStage& st = stages[s];
+        st.order = order; st.mu = mu; st.eps = stage_eps;
+        int wpad = std::max(8, order);
+        st.weights.assign(wpad, 0.0f);
+        st.energy = 0.0;
+        st.ring.assign(0x400, 0.0f);
+        st.ring_copy = order + 1;
+        st.ring_cur = order + 1;
+    }
+
+    seg_len = (int)main_interval;
+    fc_size = n_stages;
+    fc_decay = ((double)fc_weight_param - 1.0) / (double)fc_weight_param;
+    fc_coefs.assign(std::max(1, fc_size), 0.0);
+    if (fc_size > 0) fc_coefs[0] = 1.0;
+    fc_counter = 0; fc_last_halve = golomb_field;
+    fc_mat.assign(std::max(1, fc_size), std::vector<double>(std::max(1, fc_size), 0.0));
+    fc_v.assign(std::max(1, fc_size) + 1, 0.0);
+
+    schedule = sched;
+    int order_p1 = (int)main_order + 1;
+    int firstcd = std::min(order_p1, total);
+    cc_count = firstcd;
+    cc_mode = schedule[0];
+    sched_idx = 1;
+    need_init = true;
+}
+
 void OFR_PredictorCascadeMono::cascade_init() {
     bias = 0.0;
     stage_pred.assign(n_stages + 2, 0.0);

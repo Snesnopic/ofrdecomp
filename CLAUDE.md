@@ -118,6 +118,14 @@ reference encoder's choices, only be valid and self-consistent.
     `encode_bits`, the var-driven multi-branch raw_val split (fast `q=raw/uVar16`, bit-width
     `sym2=raw>>iVar14`, escape via `floor_log2`), variance starts at **0.0**. Verified mono+stereo vs
     reference. Both ent=1 and ent=2 selectable (the reference uses ent=2 for presets 0-3).
+  - **pred=3 MONO encoder** (`OFR_PRED=3`): cascade NLMS. `OFR_PredictorCascadeMono::setup_for_encode`
+    (in the -fno-fast-math pred3 TU) mirrors `init()` from explicit params; the forward loop (encoder TU,
+    integer-only + calls into the -fno-fast-math cascade methods) mirrors `decode()`. Init dual writes
+    main LPC params + n_stages + decay flag + fc weight/k + golomb flag + per-stage o5/mu10 + the
+    schedule (encode_symbol on two 2-symbol contexts, N+1 syms, all-cascade). Verified bit-exact lossless
+    vs reference (ent=1 and ent=2). Compression ≈ pred=1 with the current (untuned) fixed cascade params;
+    beating pred=1 needs schedule/stage tuning (optimization, not correctness). **STEREO pred=3 not yet
+    implemented** (the stereo encoder ignores OFR_PRED → pred=1).
   - **MONO order up to ~96** (reliable, bit-exact vs reference). Since the faithful mono weight-update
     port (below), high-order mono decodes losslessly on the reference. Default order=64 ≈ preset 4
     (beats it on music). Orders ≥192 still desync (other high-order path, not chased). **STEREO still

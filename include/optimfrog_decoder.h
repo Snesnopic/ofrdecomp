@@ -452,6 +452,13 @@ public:
     void init(OFR_RangeCoder* rc, uint32_t bit_depth, int mn, int mx, int dbits, int total);
     void decode(int32_t* dest, uint32_t count);
 
+    // encoder-side setup: mirror init() from explicit params (FP-sensitive, compiled -fno-fast-math)
+    void setup_for_encode(int mn, int mx, int dbits, int total,
+                          uint32_t main_w, uint32_t main_iv, uint32_t main_od, int n_stages_,
+                          double decay_, uint32_t fc_w, uint32_t fc_halve_k, uint32_t golomb_field,
+                          const std::vector<int>& stage_orders, const std::vector<int>& stage_mu10,
+                          const std::vector<uint8_t>& sched);
+
     // cascade internals
     void cascade_init();
     int  cascade_predict();

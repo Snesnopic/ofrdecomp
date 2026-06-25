@@ -181,36 +181,103 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
     if (getenv("OFR_WENT")) WENT = atoi(getenv("OFR_WENT"));
     if (getenv("OFR_ENT")) ENT = atoi(getenv("OFR_ENT"));   // 1=fast, 2=slow
 
+    int PRED = 1;
+    if (getenv("OFR_PRED")) PRED = atoi(getenv("OFR_PRED"));   // 1=LPC, 3=cascade
+
     OFR_RangeEncoder enc;
     // post=1 init (identity)
     enc.encode_split(16, (uint32_t)mn & 0xffff);
     enc.encode_split(16, (uint32_t)mx & 0xffff);
     enc.encode_bits(1, 0);
-    // predictor init: weight_param, interval, order (use table indices when possible, else escape)
+
     static const int IVT[8] = { 32, 64, 128, 256, 512, 1024, 2048, 0 };
     static const int ODT[9] = { 12, 24, 36, 48, 64, 96, 128, 192, 256 };
-    enc.encode_uniform(4096, (uint32_t)(WPRED - 2));
-    int iv_idx = -1; for (int i = 0; i < 7; i++) if (IVT[i] == INTERVAL) iv_idx = i;
-    if (iv_idx >= 0) enc.encode_bits(3, (uint32_t)iv_idx);
-    else { enc.encode_bits(3, 7); enc.encode_split(16, (uint32_t)(INTERVAL - 1)); }
-    int od_idx = -1; for (int i = 0; i < 9; i++) if (ODT[i] == ORDER) od_idx = i;
-    if (od_idx >= 0) enc.encode_bits(5, (uint32_t)od_idx);
-    else { enc.encode_bits(5, 31); enc.encode_bits(8, (uint32_t)(ORDER - 1)); }
-    // entropy init: 12-bit weight value (read_12bit_value dual)
-    enc.encode_uniform(4096, (uint32_t)(WENT - 2));
-
-    // predictor forward -> residuals
-    OFR_Predictor pd;
-    pd.init(ORDER, INTERVAL, (double)(WPRED - 1) / (double)WPRED);
-    pd.min_val = mn; pd.max_val = mx; pd.shift = sh;
+    static const int CASC_OT[8] = { 512, 256, 128, 64, 128, 64, 32, 16 };
     std::vector<int32_t> res(n);
-    for (uint32_t i = 0; i < n; i++) {
-        int p = (int)std::round(pd.predict());
-        int cp = std::max(mn, std::min(p, mx));
-        int v = samples[i];
-        int err = ((v - cp) << sh) >> sh;
-        res[i] = err;
-        pd.update((double)v);
+
+    if (PRED == 3) {
+        // ---- pred=3 cascade init (exact dual of OFR_PredictorCascadeMono::init) ----
+        const uint32_t MAIN_W = 256, FC_W = 256, K = 4, GOLOMB = 0x40;
+        const int N_STAGES = 2;
+        int main_iv_idx = 0;                 // interval 32
+        int main_od_idx = 1;                 // order 24
+        int MAIN_IV = IVT[main_iv_idx], MAIN_OD = ODT[main_od_idx];
+        std::vector<int> st_oidx = { 1, 6 }; // stage order index -> CASC_OT: 1=256, 6=32
+        std::vector<int> st_order = { CASC_OT[st_oidx[0]], CASC_OT[st_oidx[1]] };
+        std::vector<int> st_mu10  = { 400, 600 };
+
+        enc.encode_bits(12, MAIN_W - 2);
+        enc.encode_bits(3, (uint32_t)main_iv_idx);
+        enc.encode_bits(5, (uint32_t)main_od_idx);
+        enc.encode_bits(3, (uint32_t)(N_STAGES - 1));
+        enc.encode_bits(1, 0);               // decay flag -> 1.0
+        enc.encode_bits(12, FC_W - 2);
+        enc.encode_bits(3, K);
+        enc.encode_bits(1, 0);               // golomb flag -> 0x40
+        for (int s = 0; s < N_STAGES; ++s) {
+            enc.encode_bits(5, (uint32_t)st_oidx[s]);
+            enc.encode_bits(10, (uint32_t)st_mu10[s]);
+        }
+        // schedule (all-cascade); length nseg+2 with sentinel
+        int order_p1 = (int)MAIN_OD + 1;
+        int firstcd = std::min(order_p1, (int)n);
+        int seg_len = MAIN_IV;
+        int nseg = ((int)n + (~firstcd) + seg_len) / seg_len;
+        if (nseg < 0) nseg = 0;
+        std::vector<uint8_t> sched((size_t)nseg + 2, 1);
+        OFR_ModelContext sctx0, sctx1; sctx0.init(2, 0x8000); sctx1.init(2, 0x8000);
+        OFR_ModelContext* sctx[2] = { &sctx0, &sctx1 };
+        enc.encode_symbol(*sctx[0], sched[0]);
+        uint32_t prev = sched[0];
+        for (int i = 1; i <= nseg; ++i) { enc.encode_symbol(*sctx[prev], sched[i]); prev = sched[i]; }
+
+        // entropy init
+        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
+
+        // setup + forward (cascade machinery is in the -fno-fast-math TU)
+        OFR_PredictorCascadeMono cm;
+        cm.setup_for_encode(mn, mx, data_bits, (int)n, MAIN_W, MAIN_IV, MAIN_OD, N_STAGES,
+                            1.0, FC_W, K, GOLOMB, st_order, st_mu10, sched);
+        cm.cascade_init(); cm.sample_counter = 0xac44; cm.need_init = false;
+        for (uint32_t i = 0; i < n; i++) {
+            if (--cm.sample_counter == 0) cm.sample_counter = 0xac44;
+            int out = samples[i];
+            if (cm.cc_mode == 0) {
+                int p = (int)std::lrint(cm.main_lpc.predict());
+                int cp = std::max(mn, std::min(p, mx));
+                res[i] = ((out - cp) << sh) >> sh;
+                cm.main_lpc.update((double)out); cm.cascade_predict(); cm.cascade_update((double)out);
+            } else {
+                int p = cm.cascade_predict();
+                int cp = std::max(mn, std::min(p, mx));
+                res[i] = ((out - cp) << sh) >> sh;
+                cm.cascade_update((double)out); cm.main_lpc.update((double)out);
+            }
+            if (--cm.cc_count == 0) { cm.cc_mode = cm.schedule[cm.sched_idx]; cm.cc_count = cm.seg_len; cm.sched_idx++; }
+        }
+    } else {
+        // ---- pred=1 LPC init ----
+        enc.encode_uniform(4096, (uint32_t)(WPRED - 2));
+        int iv_idx = -1; for (int i = 0; i < 7; i++) if (IVT[i] == INTERVAL) iv_idx = i;
+        if (iv_idx >= 0) enc.encode_bits(3, (uint32_t)iv_idx);
+        else { enc.encode_bits(3, 7); enc.encode_split(16, (uint32_t)(INTERVAL - 1)); }
+        int od_idx = -1; for (int i = 0; i < 9; i++) if (ODT[i] == ORDER) od_idx = i;
+        if (od_idx >= 0) enc.encode_bits(5, (uint32_t)od_idx);
+        else { enc.encode_bits(5, 31); enc.encode_bits(8, (uint32_t)(ORDER - 1)); }
+        // entropy init
+        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
+
+        OFR_Predictor pd;
+        pd.init(ORDER, INTERVAL, (double)(WPRED - 1) / (double)WPRED);
+        pd.min_val = mn; pd.max_val = mx; pd.shift = sh;
+        for (uint32_t i = 0; i < n; i++) {
+            int p = (int)std::round(pd.predict());
+            int cp = std::max(mn, std::min(p, mx));
+            int v = samples[i];
+            int err = ((v - cp) << sh) >> sh;
+            res[i] = err;
+            pd.update((double)v);
+        }
     }
 
     // entropy encode residuals (fast = ent1, slow = ent2)
@@ -241,7 +308,7 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
     file.push_back('H'); file.push_back('E'); file.push_back('A'); file.push_back('D');
     put32(file, 0);
     // COMP block
-    uint16_t reserved = ((uint16_t)ENT << 11) | (1u << 6) | 1u;   // ent, pred=1, post=1
+    uint16_t reserved = ((uint16_t)ENT << 11) | ((uint16_t)PRED << 6) | 1u;   // ent, pred, post=1
     std::vector<uint8_t> payload;                       // D-4 bytes (everything after CRC field)
     auto p32 = [&](uint32_t v){ payload.push_back(v); payload.push_back(v>>8); payload.push_back(v>>16); payload.push_back(v>>24); };
     p32(n);                                  // number of samples in block

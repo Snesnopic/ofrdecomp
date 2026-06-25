@@ -205,31 +205,41 @@ fires at counter = halve_interval + that field (NOT at halve_interval). Same fie
 post_type=2 value-remap table (`FUN_00017f00`/`FUN_000189f0`, `optimfrog_decoder_post2.cpp`):
 **implemented**. Active only when the per-channel transform flag is set (tonal/synthetic signals).
 
-## Decoder coverage — 100% (mono AND stereo, including all pathological signals)
+## Conformance suite (`tests/conformance/`) — the source of truth
 
-**The decoder is now bit-exact on EVERYTHING.** The perfect-ramp singular-covariance gap — long the
-only documented un-closed case — is **CLOSED for both mono and stereo**:
-- mono ramp/silence/square: 12/12 each; stereo ramp/silence/square: 12/12 each
-- 24/24 real + 24/24 sine (mono+stereo), sine_mono + test_stereo MD5 intact
+Bidirectional proof vs the reference binaries: (A) every `.ofr` the reference encoder emits, our
+decoder decodes identically to `ref_gen`/original; (B) every `.ofr` our encoder emits, the reference
+decodes losslessly. Runs over the 130-file WAV corpus (`~/Downloads/WAVTESTS`) + a synthetic battery
+(silence/dc/fullscale/ramp/square/impulse/noise/sine/multitone/nearzero, odd/boundary lengths) ×
+presets × bps. Rosetta-flakiness retries (`rtry_out`). `bash tests/conformance/run.sh`
+(env: NFILES, PRESETS, BPSLIST, OURDEC). **This suite is what reveals real gaps** — the old narrow
+matrix (short single-block files) missed multi-block and degenerate-stereo bugs.
 
-How it was closed (the recipe — the weight-update/solver must be bit-for-bit faithful AND not
-reordered by the compiler):
-1. **`optimfrog_decoder_predictor.cpp` compiled `-fno-fast-math -ffp-contract=off`** (CMakeLists) — the
-   binary is -fno-fast-math; without this the careful op-ordering gets reordered and near-singular
-   covariances diverge by 1 ULP. THIS was the missing piece on all prior attempts.
-2. **Mono** (`FUN_00014e30`+`FUN_00012ca0`): `solve_ldlt` = exact `FUN_00012ca0` port (in-place stride,
-   `m[i][k]*diag[k]*m[j][k]` inner order, separate `d -= m[i][k]²*diag[k]` loop on the stored
-   normalized value, threshold 2^-17); `update_weights` damp_pow via **exp-by-squaring** (not std::pow),
-   energy gate `R[0] >= 0.5` (DAT_19770).
-3. **Stereo** (`FUN_00013310`/`FUN_00013bf0` → `FUN_00012ca0`): `OFR_SolveLDLT` threshold **2^-17**
-   (was 1e-15) and `solveCholeskyLeft/Right` energy gate **0.5** (was 1e-7). Those two constants +
-   the no-fast-math compile closed stereo ramp/square (the binary's two-stage singular fallback in
-   `FUN_00013310` is NOT needed in practice — correct constants alone suffice).
+## Decoder coverage — real audio bit-exact; degenerate/tonal-stereo gaps remain
+
+The earlier "100%" was an over-claim from the narrow matrix. The suite found and we FIXED the big one:
+- **Multi-block (real long audio) — FIXED.** The reference splits songs into many COMP blocks and
+  varies entropy_type per block; our decoder stopped after ~2 blocks (range-coder over-read +
+  entropy-type not re-inited per block). Now real 12-block music decodes bit-exact. THIS was the
+  critical real-world bug (all long files were broken).
+- Mono pathological (ramp/silence/square) bit-exact; mono predictor faithful (`FUN_00014e30`+
+  `FUN_00012ca0`, exp-by-squaring damp_pow, threshold 2^-17, `-fno-fast-math`).
+- Stereo two-stage singular fallback ported (`FUN_00013310`/`FUN_00013bf0`): impulse/fullscale stereo
+  now bit-exact.
+
+**Remaining decoder gaps (suite-tracked, narrow — degenerate/tonal stereo only; real music passes):**
+1. **Residual stereo singular fallback**: ramp/square stereo still diverge at a *later* singular
+   weight-update (e.g. ramp @frame 2769) — the two-stage fallback handles the first but not all
+   subsequent singular cases.
+2. **post=2 active value-remap on stereo**: tonal/structured stereo with the remap flag set diverges
+   from frame 0 (e.g. corpus2's first block). Mono remap + stereo identity-remap (most real music) are
+   fine; the active stereo remap path has a bug.
 
 ## Next work (ordered by cost)
 
-1. **Encoder** (in progress) — mono high-order done; next stereo high-order (still order≤24; the
-   high-order stereo path desyncs — investigate), ent=2/3 duals, pred=3, 8/24-bit.
+1. **Close the two remaining decoder gaps** above (degenerate/tonal stereo) → suite green on decode.
+2. **Encoder** direction-B suite failures on degenerate/boundary signals (impulse/fullscale/len*).
+3. Then the wishlist phases: CLI parity, directory restructure, drop-in library ABI, CI, cleanup.
 
 ## Recent fixes (this session)
 - entropy path selection by `type==1 && channels==2` (was `is_fast_stereo`) → ent=2 stereo works.

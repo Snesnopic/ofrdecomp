@@ -131,6 +131,15 @@ reference encoder's choices, only be valid and self-consistent.
     per-stage o5(sets size1/size2 via CASC_OT/CASC_S2)/mu10 + **two** interleaved schedules (4 contexts).
     Forward mirrors `decode()`: per frame L then R, each main(cross-channel LDLT) or cascade, shared
     rings A(L errs)/B(R errs). Verified bit-exact vs reference (ent=1/2, music/loud/noise stereo).
+  - **ent=3 (acm) encoder** (`AcmEncoder`, `OFR_ENT=3`, dual of `OFR_EntropyAcm`): all-integer context
+    modeling. Encoder choices (escape-free): msb_flag=0, reset=64, shared template (transform=1,
+    scale=0x8000, k=256, nsym=32), one value-context for all exponents (vmap→0), **state=0 every run**
+    (never the zero-run state 8). Per sample: pred=(k·mag>>24)+1 from hist[0]; sym2=value/pred; if
+    sym2≤nsym-2 non-escape (encode_symbol + uni/two-step residual) else escape (encode nsym-1 +
+    bit-length split: bits=int_bitlen((nsym-1)·pred), idx=floor(log2(value))-bits via uni(rem) +
+    encode_bits). hist update `hist[i]+=((value<<16)-hist[i])>>(3+i)`. Reuses `OFR_ModelContext` for the
+    bitlen[9] + value contexts (encode_symbol == ctx_decode). Verified mono+stereo vs reference.
+  - **FULL preset matrix bit-exact lossless via reference**: pred{1,3}×ent{1,2,3}×{mono,stereo} = 12/12.
   - **MONO order up to ~96** (reliable, bit-exact vs reference). Since the faithful mono weight-update
     port (below), high-order mono decodes losslessly on the reference. Default order=64 ≈ preset 4
     (beats it on music). Orders ≥192 still desync (other high-order path, not chased). **STEREO still

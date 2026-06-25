@@ -159,6 +159,101 @@ struct SlowEntropyEncoder {
     }
 };
 
+// ---- ent=3 (acm) encoder (dual of OFR_EntropyAcm). all integer. ----
+static uint32_t acm_mag_exp(int64_t mag) {
+    uint32_t u17 = (uint32_t)((uint64_t)mag >> 16);
+    uint32_t u19 = (uint32_t)((uint64_t)mag >> 32) & 0xffffu;
+    if (u17 < 0x10000u) u19 = u17;
+    uint32_t b = (u17 > 0xffffu) ? 16u : 0u;
+    if (u19 > 0xffu) { u19 >>= 8; b |= 8u; }
+    if (u19 > 0xfu)  { u19 >>= 4; b += 4u; }
+    if (u19 > 3u)    { u19 >>= 2; b += 2u; }
+    return (u19 > 1u ? 1u : 0u) + b;
+}
+static uint32_t acm_int_bitlen(uint32_t v) {
+    uint32_t u19 = (v >> 16) ? (v >> 16) : v;
+    uint32_t b = (v > 0xffffu) ? 16u : 0u;
+    if (u19 > 0xffu) { u19 >>= 8; b |= 8u; }
+    if (u19 > 0xfu)  { u19 >>= 4; b += 4u; }
+    if (u19 > 3u)    { u19 >>= 2; b += 2u; }
+    return (u19 > 1u ? 1u : 0u) + b;
+}
+struct AcmEncoder {
+    struct Chan {
+        uint32_t reset = 64, state = 0, countdown = 0;
+        int64_t hist[8] = {0,0,0,0,0,0,0,0};
+        std::vector<OFR_ModelContext> bitlen;   // 9 contexts
+        OFR_ModelContext vctx;                  // single shared value context
+        uint32_t k = 0, nsym = 0;
+    };
+    std::vector<Chan> chans;
+    uint32_t bit_depth = 0;
+
+    void init(OFR_RangeEncoder& enc, uint32_t bd, uint32_t ch) {
+        bit_depth = bd;
+        chans.assign(ch, Chan());
+        const uint32_t T_SCALE_S = 3, T_K = 256, T_NSYM = 32;   // scale=1<<15, k, nsym
+        for (uint32_t ci = 0; ci < ch; ++ci) {
+            Chan& c = chans[ci];
+            enc.encode_uniform(2, 0);            // msb_flag = 0
+            enc.encode_uniform(16, 0);           // reset idx 0 -> reset = 1<<6 = 64
+            c.reset = 64;
+            enc.encode_uniform(2, 1);            // template present
+            enc.encode_uniform(2, 0);            // t_transform = 1
+            enc.encode_uniform(8, T_SCALE_S);    // t_scale = 1<<(3+12) = 0x8000
+            enc.encode_bits(8, T_K - 1);         // t_k = 256
+            enc.encode_uniform(128, T_NSYM - 2); // t_nsym = 32
+            // per-exponent context map: one context (cur=0) for all exponents
+            for (uint32_t e = 0; e < bit_depth; ++e)
+                enc.encode_uniform(2, e == 0 ? 1 : 0);
+            c.k = T_K; c.nsym = T_NSYM;
+            c.vctx.init(T_NSYM, 0x8000u);
+            c.bitlen.assign(9, OFR_ModelContext());
+            for (int i = 0; i < 9; ++i) c.bitlen[i].init(9, 0x8000u);
+            for (int i = 0; i < 8; ++i) c.hist[i] = 0;
+            c.countdown = 0; c.state = 0;
+        }
+    }
+
+    void encode_sample(OFR_RangeEncoder& enc, Chan& c, uint32_t value) {
+        uint32_t state = c.state;
+        if (c.countdown == 0) {
+            enc.encode_symbol(c.bitlen[state], 0);   // chosen state symbol = 0 (never 8)
+            c.state = 0; c.countdown = c.reset - 1u; state = 0;
+        } else {
+            c.countdown--;
+        }
+        int64_t mag = c.hist[state];                 // msb_flag=0, state=0
+        uint32_t e = acm_mag_exp(mag);
+        (void)e;                                     // vmap[e] == 0 for all e
+        uint32_t k = c.k;
+        uint32_t pred = (uint32_t)(((uint64_t)k * (uint64_t)mag) >> 24) + 1u;
+        uint32_t sym2 = value / pred;
+        if (sym2 <= c.nsym - 2u) {
+            enc.encode_symbol(c.vctx, sym2);
+            uint32_t residual = value - sym2 * pred;
+            if (pred < 0x4001u) {
+                enc.encode_uniform(pred, residual);
+            } else {
+                uint32_t u19 = (pred - 1u + 0x4000u) >> 14;
+                uint32_t u18 = (pred - 1u + u19) / u19;
+                enc.encode_uniform(u18, residual / u19);
+                enc.encode_uniform(u19, residual % u19);
+            }
+        } else {
+            enc.encode_symbol(c.vctx, c.nsym - 1u);  // escape
+            uint32_t v = (c.nsym - 1u) * pred;
+            uint32_t bits = acm_int_bitlen(v);
+            uint32_t rem = bit_depth - bits;
+            uint32_t total_bits = acm_int_bitlen(value);
+            enc.encode_uniform(rem, total_bits - bits);
+            enc.encode_bits(total_bits, value - (1u << total_bits));
+        }
+        int64_t lv = (int64_t)value << 16;
+        for (int i = 0; i < 8; ++i) c.hist[i] += (lv - c.hist[i]) >> (3 + i);
+    }
+};
+
 static void put32(std::vector<uint8_t>& o, uint32_t v) { o.push_back(v); o.push_back(v>>8); o.push_back(v>>16); o.push_back(v>>24); }
 static void put16(std::vector<uint8_t>& o, uint16_t v) { o.push_back(v); o.push_back(v>>8); }
 
@@ -231,9 +326,6 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
         uint32_t prev = sched[0];
         for (int i = 1; i <= nseg; ++i) { enc.encode_symbol(*sctx[prev], sched[i]); prev = sched[i]; }
 
-        // entropy init
-        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
-
         // setup + forward (cascade machinery is in the -fno-fast-math TU)
         OFR_PredictorCascadeMono cm;
         cm.setup_for_encode(mn, mx, data_bits, (int)n, MAIN_W, MAIN_IV, MAIN_OD, N_STAGES,
@@ -264,8 +356,6 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
         int od_idx = -1; for (int i = 0; i < 9; i++) if (ODT[i] == ORDER) od_idx = i;
         if (od_idx >= 0) enc.encode_bits(5, (uint32_t)od_idx);
         else { enc.encode_bits(5, 31); enc.encode_bits(8, (uint32_t)(ORDER - 1)); }
-        // entropy init
-        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
 
         OFR_Predictor pd;
         pd.init(ORDER, INTERVAL, (double)(WPRED - 1) / (double)WPRED);
@@ -280,12 +370,21 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
         }
     }
 
-    // entropy encode residuals (fast = ent1, slow = ent2)
-    if (ENT == 2) {
+    // entropy init (after predictor init in the stream) + encode residuals
+    if (ENT == 3) {
+        AcmEncoder acm; acm.init(enc, (uint32_t)data_bits, 1);
+        for (uint32_t i = 0; i < n; i++) {
+            int32_t r = res[i];
+            uint32_t value = (r >= 0) ? ((uint32_t)r << 1) : (((uint32_t)(-r) << 1) - 1u);
+            acm.encode_sample(enc, acm.chans[0], value);
+        }
+    } else if (ENT == 2) {
+        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
         SlowEntropyEncoder ent; ent.init((uint32_t)data_bits, (uint32_t)WENT);
         double var = 0.0;   // slow path variance starts at 0.0
         for (uint32_t i = 0; i < n; i++) ent.encode_sample(enc, var, res[i]);
     } else {
+        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
         FastEntropyEncoder ent; ent.init((uint32_t)data_bits, (uint32_t)WENT);
         double var = 1.0;
         for (uint32_t i = 0; i < n; i++) ent.encode_sample(enc, var, res[i]);
@@ -400,8 +499,6 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
             enc.encode_symbol(*cl[pL], schL[i]); pL = schL[i];
             enc.encode_symbol(*cr[pR], schR[i]); pR = schR[i];
         }
-        // entropy init
-        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
 
         OFR_PredictorCascadeStereo cs;
         cs.setup_for_encode(mnL, mxL, mnR, mxR, data_bits, (int)(2 * frames),
@@ -446,7 +543,6 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
         enc.encode_bits(12, (uint32_t)(WPRED - 2));
         enc.encode_bits(3, (uint32_t)IV_IDX);
         enc.encode_bits(5, (uint32_t)OD_IDX);
-        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
 
         OFR_PredictorStereo_Inner inner;
         inner.init((double)(WPRED - 1) / (double)WPRED, max_order, max_order - right_order, (uint32_t)interval);
@@ -463,8 +559,16 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
         }
     }
 
-    // entropy encode (interleaved L/R, two variances)
-    if (ENT == 2) {
+    // entropy init (after predictor init in the stream) + encode (interleaved L/R)
+    if (ENT == 3) {
+        AcmEncoder acm; acm.init(enc, (uint32_t)data_bits, 2);
+        for (uint32_t i = 0; i < 2 * frames; i++) {
+            int32_t r = res[i];
+            uint32_t value = (r >= 0) ? ((uint32_t)r << 1) : (((uint32_t)(-r) << 1) - 1u);
+            acm.encode_sample(enc, acm.chans[i & 1], value);
+        }
+    } else if (ENT == 2) {
+        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
         SlowEntropyEncoder ent; ent.init((uint32_t)data_bits, (uint32_t)WENT);
         double var_L = 0.0, var_R = 0.0;
         for (uint32_t i = 0; i < 2 * frames; i += 2) {
@@ -472,6 +576,7 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
             ent.encode_sample(enc, var_R, res[i+1]);
         }
     } else {
+        enc.encode_uniform(4096, (uint32_t)(WENT - 2));
         FastEntropyEncoder ent; ent.init((uint32_t)data_bits, (uint32_t)WENT);   // shared contexts
         double var_L = 1.0, var_R = 1.0;
         for (uint32_t i = 0; i < 2 * frames; i += 2) {

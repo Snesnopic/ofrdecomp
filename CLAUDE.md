@@ -146,6 +146,12 @@ reference encoder's choices, only be valid and self-consistent.
     `ref_gen.c` rewritten byte-based (writes bitspersample/8 bytes per value, the native container).
     CLI: `ofrenc in.raw out.ofr rate [channels=1] [bps=16]`. data_bits (predictor shift, entropy depth)
     still = ofr_bitlen(min,max); only the post split width uses bitspersample.
+  - **`OFR_BEST=1` config search**: the CLI tries a small set of safe configs (pred1 orders {24,64,96}
+    mono / od_idx {0,1} stereo, pred3, × ent{1,2,3}) via setenv + re-encode, keeps the smallest (all
+    paths are verified lossless so smallest-by-size is safe). Picks per-signal: music→pred1/ent1/order96,
+    noise→order24, etc. Result on music mono: 50173 bytes — beats reference presets 0-4 (53322→50694),
+    ~matches preset 5-6, slightly behind preset 10 (49725, which uses param/schedule optimization we don't
+    replicate). Competitive for a from-scratch encoder.
   - **MONO order up to ~96** (reliable, bit-exact vs reference). Since the faithful mono weight-update
     port (below), high-order mono decodes losslessly on the reference. Default order=64 ≈ preset 4
     (beats it on music). Orders ≥192 still desync (other high-order path, not chased). **STEREO still

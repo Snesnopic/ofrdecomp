@@ -694,11 +694,32 @@ void OFR_PredictorStereo_Inner::solveCholeskyLeft() {
 
     if (!OFR_SolveLDLT(&m_temp_matrix[0][0], m_left_coefs, m_temp_vector, m_max_order)) {
         m_is_cholesky_fail_left = 1;
-        m_left_coefs[0] = 1.0;
-        if (m_max_order > 1) {
-            for (int i = 1; i < m_max_order; ++i) {
-                m_left_coefs[i] = 0.0;
+        // two-stage singular fallback (FUN_00013310): zero coefs; a single tap with R[0]==R[2i+2];
+        // else rebuild the left-only (mono) block of left_order and re-solve; else coef0=1.
+        for (int i = 0; i < m_max_order; ++i) m_left_coefs[i] = 0.0;
+        for (int i = 0; i < m_max_order; ++i)
+            if (m_R_left[0] == m_R_left[2*i+2]) { m_left_coefs[i] = 1.0; return; }
+        double iw = 1.0 / m_weight;
+        double* hl = m_left_hist_ptr;
+        int L = m_left_order;
+        if (m_count_left < 48000) {
+            for (int i = 0; i < L; ++i) {
+                m_temp_matrix[i][0] = (m_R_left[i*2] - hl[0]*hl[i]) * iw + m_left_matrix[i][0];
+                for (int j = 1; j <= i; ++j)
+                    m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hl[j]*hl[i]) * iw + m_left_matrix[i][j];
+                m_left_coefs[i] = m_R_left[i*2+2];
             }
+        } else {
+            for (int i = 0; i < L; ++i) {
+                m_temp_matrix[i][0] = (m_R_left[i*2] - hl[0]*hl[i]) * iw;
+                for (int j = 1; j <= i; ++j)
+                    m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hl[j]*hl[i]) * iw;
+                m_left_coefs[i] = m_R_left[i*2+2];
+            }
+        }
+        if (!OFR_SolveLDLT(&m_temp_matrix[0][0], m_left_coefs, m_temp_vector, L)) {
+            m_left_coefs[0] = 1.0;
+            for (int i = 1; i < L; ++i) m_left_coefs[i] = 0.0;
         }
     }
 }
@@ -777,11 +798,32 @@ void OFR_PredictorStereo_Inner::solveCholeskyRight() {
 
     if (!OFR_SolveLDLT(&m_temp_matrix[0][0], m_right_coefs, m_temp_vector, m_max_order)) {
         m_is_cholesky_fail_right = 1;
-        m_right_coefs[0] = 1.0;
-        if (m_max_order > 1) {
-            for (int i = 1; i < m_max_order; ++i) {
-                m_right_coefs[i] = 0.0;
+        // two-stage singular fallback (FUN_00013bf0): mirror of the left, using right history /
+        // right autocorr, block size = left_order (the cross-channel primary block size).
+        for (int i = 0; i < m_max_order; ++i) m_right_coefs[i] = 0.0;
+        for (int i = 0; i < m_max_order; ++i)
+            if (m_R_right[0] == m_R_right[2*i+2]) { m_right_coefs[i] = 1.0; return; }
+        double iw = 1.0 / m_weight;
+        double* hr = m_right_hist_ptr;
+        int L = m_left_order;
+        if (m_count_right < 48000) {
+            for (int i = 0; i < L; ++i) {
+                m_temp_matrix[i][0] = (m_R_right[i*2] - hr[0]*hr[i]) * iw + m_right_matrix[i][0];
+                for (int j = 1; j <= i; ++j)
+                    m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hr[j]*hr[i]) * iw + m_right_matrix[i][j];
+                m_right_coefs[i] = m_R_right[i*2+2];
             }
+        } else {
+            for (int i = 0; i < L; ++i) {
+                m_temp_matrix[i][0] = (m_R_right[i*2] - hr[0]*hr[i]) * iw;
+                for (int j = 1; j <= i; ++j)
+                    m_temp_matrix[i][j] = (m_temp_matrix[i-1][j-1] - hr[j]*hr[i]) * iw;
+                m_right_coefs[i] = m_R_right[i*2+2];
+            }
+        }
+        if (!OFR_SolveLDLT(&m_temp_matrix[0][0], m_right_coefs, m_temp_vector, L)) {
+            m_right_coefs[0] = 1.0;
+            for (int i = 1; i < L; ++i) m_right_coefs[i] = 0.0;
         }
     }
 }

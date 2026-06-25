@@ -108,7 +108,11 @@ transform flag `obj+0x9a`==1 — triggered by tonal/synthetic signals (pure sine
 
 ## Next work (ordered by cost)
 
-1. **pred_type=3** (presets 4→max) — IN PROGRESS, fully reverse-engineered. **See `doc/pred3_analysis.md`
+0. **pred_type=3 STEREO** (presets 4-10 stereo) — mono is DONE/bit-exact. Stereo reuses
+   `OFR_PredictorStereo_Inner` (already bit-exact) + a **cross-channel** cascade (decode `FUN_00009c20`,
+   per-stage FIR `FUN_0000f980` takes both channels' history, two schedules). See `doc/pred3_analysis.md`
+   "Stereo pred=3" section. Matrix: 15/24 presets pass (all mono 0-10 + stereo pred=1 0-3).
+1. **pred_type=3** (presets 4→max) — mono done; stereo + max remain. Fully reverse-engineered. **See `doc/pred3_analysis.md`
    for the complete function-by-function map** (object layout, decode loop, cascade NLMS predict/update,
    stage FIR, final combiner, and the init that reads params + decodes the entropy-coded segment schedule).
    It is a DUAL predictor: standard LPC (object+0x10, same as pred=1) + a secondary **cascade of float32

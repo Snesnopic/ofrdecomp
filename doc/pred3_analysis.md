@@ -89,6 +89,22 @@ cc+0 = counter++; cc+2=size; cc+6=decay; cc+8.. inner coef matrix; halve via FUN
 - stage alloc `FUN_0000e850(mu?, eps?, stage, order)`: weights = order floats (16-aligned, min 8), zeroed.
 - final init `FUN_00015830(weight,cc,size,?,?)`: bzero 0x6e8; cc+8=size, cc+0xc, cc+0x18=weight(decay), cc+0x268=1.0.
 
+## Stereo pred=3 (FUN_00009c20 decode, FUN_00009be0 setup, object 0x67xxx) — TODO
+Mirrors mono but: main predictor at +0x10 is `OFR_PredictorStereo_Inner` (the pred=1 stereo
+cross-channel LDLT, already bit-exact); secondary cascade at +0x65c80 is a **cross-channel**
+cascade with TWO channels + TWO schedules (L at +0x67290, R at +0x7b690).
+- per frame: decode L (mode +0x67188, predictLeft FUN_00012ed0 / cascade-L FUN_0000f2d0 predict,
+  FUN_0000f400 update; clamp [0x67158,0x6715c]), then R (mode +0x6718c, predictRight FUN_00012f90 /
+  cascade-R FUN_0000f510, FUN_0000f640; clamp [0x67160,0x67164]). Shared countdown +0x67190,
+  reset +0x67184, sched idx +0x67194.
+- cascade init FUN_0000f130 (reads param block at +0x67198).
+- cascade-L predict FUN_0000f2d0: SAME shape as mono FUN_0000edc0 but stage stride 0x30 (not 0x28),
+  offsets: stages count +0x14c0, cumsum +0x1390, ring +0x1130, stage +0xdd0, stage_pred +0x1300,
+  bias +0x12e0. Per-stage predict is **FUN_0000f980 (3 args: stage, ringptr, +0x1208+s*0x18)** — the
+  extra arg is the OTHER channel's history → cross-channel FIR. Final combiner reuses FUN_000154e0.
+- Need: FUN_0000f980 (cross-channel stage FIR), FUN_0000f130/predict/update for both channels, the
+  init reading stereo cascade params + 2 schedules. Reuse mono cascade machinery + add cross-channel FIR.
+
 ## Helper functions to port
 predict: FUN_0000edc0, FUN_0000f850, FUN_000154e0
 update:  FUN_0000eee0, FUN_0000f8c0, FUN_00015890, FUN_00015570(halve)

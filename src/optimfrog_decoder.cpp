@@ -168,9 +168,15 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             uint16_t uVar15 = bs->readU16();
             
             
-            // Skip 1 byte (possibly CRC-8)
+            // Skip 1 byte (encoder ID low byte; the range stream's dummy b0 is the next byte)
             bs->readU8();
-            
+
+            // bound the range coder to this block's payload so it cannot over-read into the
+            // next COMP block. payload = D - 13 (CRC4+num4+type1+cfg1+reserved2+idbyte1 already read).
+            this->m_payload_len = (compressed_size >= 13) ? (compressed_size - 13) : 0;
+            this->m_payload_start = bs->tell();
+            bs->range_budget = (long)this->m_payload_len;
+
             this->range_coder.init(bs);
 
             uint32_t entropy_type = uVar15 >> 11;
@@ -263,8 +269,10 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             } else if (entropy_type != 0) {
                 if (!this->block_decoder.entropy) {
                     this->block_decoder.entropy = new OFR_EntropyDecoder();
-                    this->block_decoder.entropy->init((uint32_t)data_bits, this->channels, entropy_type, true);
                 }
+                // entropy_type can change per block (the reference mixes ent=1/ent=2) — re-init each
+                // block so type/bit_depth/channels track the current block, then read its weight.
+                this->block_decoder.entropy->init((uint32_t)data_bits, this->channels, entropy_type, true);
                 this->block_decoder.entropy->init_from_bitstream(&this->range_coder);
             }
 
@@ -299,6 +307,11 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
         this->samples_read_so_far += to_read;
 
         if (this->block_pos == this->block_size) {
+            // realign to the next COMP: skip any payload bytes the range coder didn't consume
+            // (it stops at/under the budget; the next COMP starts exactly at payload_start+payload_len).
+            bs->range_budget = -1;
+            uint32_t consumed = bs->tell() - this->m_payload_start;
+            for (uint32_t k = consumed; k < this->m_payload_len; ++k) bs->readU8();
             this->need_new_block = true;
         }
 

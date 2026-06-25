@@ -19,10 +19,15 @@ public:
     uint32_t buf_pos;
     uint32_t buf_avail;
     uint32_t total_read;
+    // per-block byte budget for the range coder: -1 = unlimited (header reads); >=0 = payload
+    // bytes left (range coder must not over-read into the next COMP block). 0 => EOF-fill with 0.
+    long range_budget = -1;
 
     OFR_BitStream(ReadInterfaceWrapper* w) : wrapper(w), buf_pos(0), buf_avail(0), total_read(0) {}
 
     uint8_t readByte() {
+        if (range_budget == 0) return 0;
+        if (range_budget > 0) range_budget--;
         if (buf_avail == 0) {
             buf_avail = wrapper->rInt->read(wrapper->readerInstance, buffer, sizeof(buffer));
             buf_pos = 0;
@@ -651,6 +656,10 @@ public:
     bool block_error;
     sInt64_t block_end_pos;
     void* corr_stream;
+    // multi-block: track the current COMP payload so the range coder stays inside it and we
+    // realign to the next COMP after the block (the range coder otherwise over-reads).
+    uint32_t m_payload_start = 0;
+    uint32_t m_payload_len = 0;
 };
 
 

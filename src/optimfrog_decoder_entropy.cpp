@@ -428,9 +428,8 @@ int32_t OFR_EntropyDecoder::fast_decode_sample(double& var, OFR_RangeCoder* rc) 
 // decode_block
 // ============================================================
 int32_t OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_RangeCoder* rc) {
-    if (type == 1 && channels == 2) {
+    if (type == 1) {   // fast entropy (FUN_00004710), 1 or 2 channels
         if (needs_init) {
-            // FUN_00004710 init: num_contexts = bit_depth*2, per-ctx symbols from bit_depth
             uint32_t num_contexts = bit_depth * 2u;
             uint32_t per_symbols = (bit_depth < 4u) ? (1u << bit_depth) : (bit_depth * 8u - 0x10u);
             fast_contexts.assign(num_contexts, FastCtx());
@@ -440,9 +439,14 @@ int32_t OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_Rang
             fast_var_R = 1.0;
             needs_init = false;
         }
-        for (uint32_t i = 0; i < count; i += 2) {
-            dest[i]     = fast_decode_sample(fast_var_L, rc);
-            dest[i + 1] = fast_decode_sample(fast_var_R, rc);
+        if (channels == 2) {
+            for (uint32_t i = 0; i < count; i += 2) {
+                dest[i]     = fast_decode_sample(fast_var_L, rc);
+                dest[i + 1] = fast_decode_sample(fast_var_R, rc);
+            }
+        } else {
+            for (uint32_t i = 0; i < count; ++i)
+                dest[i] = fast_decode_sample(fast_var_L, rc);
         }
         decoded_samples += count;
         return 1;

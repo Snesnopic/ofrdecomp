@@ -183,7 +183,11 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                 if (!this->block_decoder.post_processor) {
                     this->block_decoder.post_processor = new OFR_PostProcessor();
                 }
-                this->block_decoder.post_processor->init(&this->range_coder, reduced_bit_depth, this->channels);
+                if (post_type == 2) {
+                    this->block_decoder.post_processor->init2(&this->range_coder, this->channels);
+                } else {
+                    this->block_decoder.post_processor->init(&this->range_coder, reduced_bit_depth, this->channels);
+                }
             }
 
             // data bit-length (local_4c in FUN_00010870) drives predictor shift and entropy depth

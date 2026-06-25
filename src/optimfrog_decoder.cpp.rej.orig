@@ -1,22 +1,8 @@
-@@ -155,6 +155,8 @@
-             
-             this->range_coder.init(bs);
-             
-+            uint32_t entropy_type = uVar15 >> 11;
-+            
-             uint32_t reduced_bit_depth = this->bitspersample;
-             if (this->method > 5 && this->bitspersample == 16) {
-                 reduced_bit_depth = 13;
-@@ -193,10 +195,10 @@
-                 if (!this->block_decoder.entropy) {
-                     this->block_decoder.entropy = new OFR_EntropyDecoder();
-                 }
-                 if (this->channels == 1) {
--                    this->block_decoder.entropy->init(this->bitspersample, this->channels, true);
-+                    this->block_decoder.entropy->init(reduced_bit_depth, this->channels, entropy_type, true);
-                 } else {
--                    this->block_decoder.entropy->init(this->bitspersample, this->channels, true);
-+                    this->block_decoder.entropy->init(reduced_bit_depth, this->channels, entropy_type, true);
-                 }
-                 this->block_decoder.entropy->init_from_bitstream(&this->range_coder);
-             }
+@@ -216,6 +216,7 @@
+         this->bitstream.init(&this->data_bs);
+         
+         this->block_decoder.init_from_bitstream(&this->bitstream);
++        printf("Bits consumed before start_decoding: %u\n", this->bitstream.total_bits_read);
+         
+         // Start RangeCoder
+         this->range_coder.start_decoding(&this->bitstream);

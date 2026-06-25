@@ -1,16 +1,9 @@
-@@ -125,15 +125,11 @@
-         int16_t* dest16 = (int16_t*)dest;
-         for (uint32_t i = 0; i < num_samples; ++i) {
-             dest16[i] = (int16_t)src32[i];
--            if (i < 10) {
--            }
+@@ -231,6 +231,8 @@
+         if (this->block_decoder.predictor) {
+             this->block_decoder.predictor->init_from_bitstream(&this->range_coder);
          }
-     } else {
-         int32_t* dest32 = (int32_t*)dest;
-         for (uint32_t i = 0; i < num_samples; ++i) {
-             dest32[i] = src32[i];
--            if (i < 10) {
--            }
-         }
++        
++        printf("CPP Range after Predictor init: value=%x range=%x\n", this->range_coder.value, this->range_coder.range);
      }
  
+     // Decode block

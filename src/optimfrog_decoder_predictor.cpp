@@ -380,7 +380,15 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
 
 void OFR_PostProcessor::decode(int* dest, int count, int channels) {
     if (count == 0) return;
-    for (int i = 0; i < count * channels; i += channels) { 
+    if (has_remap) {
+        // post_type=2 value-remap: dense index -> sparse original value
+        for (int i = 0; i < count * channels; i += channels) {
+            for (int ch = 0; ch < channels; ++ch)
+                dest[i + ch] = remap_tbl[ch][dest[i + ch] - remap_lo[ch]];
+        }
+        return;
+    }
+    for (int i = 0; i < count * channels; i += channels) {
         if (m_channels == 1) {
             int32_t left = dest[i];
             int64_t left_scaled = (int64_t)left * mult_L + offset_L;

@@ -229,6 +229,15 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                     ps->m_right_max = pp->max_val_R;
                     ps->m_shift = 32u - (uint32_t)data_bits;
                 }
+            } else if (pred_type == 3 && this->channels == 1) {
+                if (!this->block_decoder.predictor_cascade_mono) {
+                    this->block_decoder.predictor_cascade_mono = new OFR_PredictorCascadeMono();
+                }
+                OFR_PostProcessor* pp = this->block_decoder.post_processor;
+                int mn = pp ? pp->min_val_L : -0x800000;
+                int mx = pp ? pp->max_val_L : 0x7fffff;
+                this->block_decoder.predictor_cascade_mono->init(
+                    &this->range_coder, this->bitspersample, mn, mx, data_bits, (int)uncompressed_size);
             }
 
             // Entropy Coder

@@ -78,6 +78,17 @@ cc+0 = counter++; cc+2=size; cc+6=decay; cc+8.. inner coef matrix; halve via FUN
   (FUN_0000fb90/FUN_00002df0 — same family already ported for fast-stereo entropy contexts).
 - Stereo pred=3 adds L/R + cc cross-channel alternation on top (object 0x67xxx).
 
+## Constants / tables (from .data)
+- `DAT_19688 = 1000.0`  → per-stage mu = read10(idx in [0,1023]) / 1000.0
+- `DAT_19718 = 1/1024 (2^-10)` → 0x43798 scale = read10(idx)/1024 (only if its 1-bit flag set; else 1.0)
+- `DAT_21ea2[]` (cascade stage order table, shorts): {512,256,128,64,128,64,32,16,0,...}; order = table[idx5]*4+4 (idx5==0x1f → read8*4+4)
+- interval table `DAT_21ca0` and order table `DAT_21cd0` = same as pred=1 (`DAT_00326238`/`DAT_00326220` in our code)
+- `FUN_00016830` = read 16-bit; `FUN_00016760` = read 8-bit (already have as read_uniform_bits(16/8))
+- ring init `FUN_0000f760(ring, order+1, 0x400)`: ring[+0x10]=order+1(copycount), [+0x14]=0x400(size),
+  alloc 0x400 floats zeroed [0..order+1], cur ptr = base+(order+1).
+- stage alloc `FUN_0000e850(mu?, eps?, stage, order)`: weights = order floats (16-aligned, min 8), zeroed.
+- final init `FUN_00015830(weight,cc,size,?,?)`: bzero 0x6e8; cc+8=size, cc+0xc, cc+0x18=weight(decay), cc+0x268=1.0.
+
 ## Helper functions to port
 predict: FUN_0000edc0, FUN_0000f850, FUN_000154e0
 update:  FUN_0000eee0, FUN_0000f8c0, FUN_00015890, FUN_00015570(halve)

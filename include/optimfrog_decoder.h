@@ -403,6 +403,61 @@ public:
 };
 
 
+// pred_type=3: dual predictor (LPC + cascade NLMS). See doc/pred3_analysis.md.
+struct OFR_CascadeStage {
+    std::vector<float> weights;   // order taps
+    int order;
+    double energy;                // sliding energy (binary stores double via MOVSD)
+    double mu;
+    double eps;
+    std::vector<float> ring;      // 0x400 floats
+    int ring_cur;                 // index of current head
+    int ring_copy;                // order+1
+};
+
+class OFR_PredictorCascadeMono {
+public:
+    OFR_Predictor main_lpc;       // the +0x10 LPC
+
+    int n_stages = 0;
+    std::vector<OFR_CascadeStage> stages;   // 1-based (index 0 unused)
+    double bias = 0.0, decay = 1.0;
+    std::vector<double> stage_pred;         // [s]
+    std::vector<double> errv;               // [s]
+    std::vector<double> cumsum;             // [s]
+
+    // final combiner (NLMS over cumulative stage outputs)
+    uint32_t fc_counter = 0;
+    uint32_t fc_last_halve = 0;
+    int fc_size = 0;
+    uint32_t fc_halve_interval = 0;
+    double fc_decay = 1.0;
+    std::vector<double> fc_coefs;           // size fc_size (the +0x268 array)
+    std::vector<std::vector<double>> fc_mat; // covariance M (lower-tri), exp-weighted
+    std::vector<double> fc_v;                // cross-correlation V[0..fc_size]
+    void fc_solve();
+
+    int min_val = 0, max_val = 0, shift = 0;
+    int total_samples = 0;
+    uint32_t main_weight_param = 0, main_order = 0, main_interval = 0;
+
+    int seg_len = 0;       // 0x436ac
+    int cc_count = 0;      // 0x436b4 countdown
+    int cc_mode = 0;       // 0x436b0
+    uint32_t sched_idx = 0; // 0x436b8
+    std::vector<uint8_t> schedule;  // 0x437b8
+    bool need_init = false;
+    uint32_t sample_counter = 0;
+
+    void init(OFR_RangeCoder* rc, uint32_t bit_depth, int mn, int mx, int dbits, int total);
+    void decode(int32_t* dest, uint32_t count);
+
+    // cascade internals
+    void cascade_init();
+    int  cascade_predict();
+    void cascade_update(double actual);
+};
+
 class OFR_PostProcessor {
 public:
     void init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t channels);
@@ -442,10 +497,11 @@ public:
     OFR_Predictor* predictor;
     OFR_PredictorFastStereo* predictor_fast_stereo;
     OFR_PredictorStereo* predictor_stereo;
+    OFR_PredictorCascadeMono* predictor_cascade_mono;
     OFR_PostProcessor* post_processor;
-    
-    OFR_BlockDecoder() : entropy(nullptr), predictor(nullptr), predictor_fast_stereo(nullptr), predictor_stereo(nullptr), post_processor(nullptr) {}
-    
+
+    OFR_BlockDecoder() : entropy(nullptr), predictor(nullptr), predictor_fast_stereo(nullptr), predictor_stereo(nullptr), predictor_cascade_mono(nullptr), post_processor(nullptr) {}
+
     void decode_block(uint32_t* dest, uint32_t count, OFR_RangeCoder* rc) {
         if (entropy) entropy->decode_block((int32_t*)dest, count, rc);
         if (predictor) {
@@ -454,6 +510,7 @@ public:
         }
         if (predictor_fast_stereo) predictor_fast_stereo->decode((int*)dest, count);
         if (predictor_stereo) predictor_stereo->decode((int32_t*)dest, count);
+        if (predictor_cascade_mono) predictor_cascade_mono->decode((int32_t*)dest, count);
         if (post_processor) post_processor->decode((int*)dest, count, post_processor->m_channels);
     }
 };

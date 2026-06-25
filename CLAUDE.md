@@ -81,14 +81,27 @@ The COMP block's "2 bytes reserved" word encodes `pred=(w>>6)&0x1f, ent=w>>11, p
 
 ## Test status (preset matrix, 16-bit, realistic non-tonal sources)
 
-**`pred_type=1` path is 100% complete** — presets 0-3 (fast/normal/high) PASS for BOTH mono and stereo,
-across entropy types 1 & 2 and post types 1 & 2. 8/24 preset×channel combos pass.
+**`pred_type=1` complete** (presets 0-3, mono+stereo). **`pred_type=3` mono complete** (presets 4-10).
 
 | Combo | Status |
 |---|---|
 | pred=1, ent∈{1,2}, post∈{1,2}, mono+stereo (presets 0-3) | PASS bit-exact |
-| pred=3 (presets 4-10) | FAIL — not implemented |
-| pred=3 + ent=3 (preset max) | FAIL — not implemented |
+| pred=3 mono (presets 4-10) | PASS bit-exact (cascade NLMS, `optimfrog_decoder_pred3.cpp`) |
+| pred=3 stereo (presets 4-10) | FAIL — not implemented yet |
+| pred=3 + ent=3 (preset max) | FAIL — entropy_type=3 not implemented |
+
+### pred_type=3 mono notes (bit-exact)
+- Dual predictor: LPC (reuses `OFR_Predictor`) + cascade NLMS, alternating per segment via an
+  entropy-coded schedule. See `doc/pred3_analysis.md`.
+- **Float32 bit-exactness was the hard part** (TU compiled `-fno-fast-math -ffp-contract=off`):
+  the stage FIR must match the SSE accumulation grouping EXACTLY — per iteration
+  `acc = h[j+4]*w[j+4] + (h[j]*w[j] + acc)`, and the horizontal sum is pairwise
+  `((a8+a7)+(a6+a5))` with each lane promoted to double. Stage energy is a **double** (the
+  Ghidra `(long)dVar3` was a misread; the asm uses MOVSD). Schedule decode reads N+1 symbols
+  (off-by-one matters — RC desync otherwise).
+- Final combiner = LDLT-solved LPC over cascade cumulative outputs (`FUN_00015890` builds
+  exp-weighted covariance M + cross-corr V; `FUN_00015570` periodically re-solves via `FUN_000152c0`,
+  an LDLT with row stride 8, diag threshold 2^-17, energy gate V[0]>=0.5).
 
 Remaining pred=1 gap: **post_type=2 value-remap table** (`FUN_00017f00`/`FUN_00018cb0`), only active when the
 transform flag `obj+0x9a`==1 — triggered by tonal/synthetic signals (pure sine, ramp), NOT real audio.

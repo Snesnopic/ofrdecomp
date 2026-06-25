@@ -140,6 +140,12 @@ reference encoder's choices, only be valid and self-consistent.
     encode_bits). hist update `hist[i]+=((value<<16)-hist[i])>>(3+i)`. Reuses `OFR_ModelContext` for the
     bitlen[9] + value contexts (encode_symbol == ctx_decode). Verified mono+stereo vs reference.
   - **FULL preset matrix bit-exact lossless via reference**: pred{1,3}×ent{1,2,3}×{mono,stereo} = 12/12.
+  - **Sample types 8/16/24/32-bit** (`ofr_encode_mono`/`ofr_encode_stereo` take `int32_t*` + `bps`):
+    the post=1 init split width = bitspersample (was hardcoded 16 — latent bug), sample_type byte from
+    bps (8→1,16→3,24→5,32→7), input sign-extended from bps. Verified bit-exact vs reference at 8/16/24/32.
+    `ref_gen.c` rewritten byte-based (writes bitspersample/8 bytes per value, the native container).
+    CLI: `ofrenc in.raw out.ofr rate [channels=1] [bps=16]`. data_bits (predictor shift, entropy depth)
+    still = ofr_bitlen(min,max); only the post split width uses bitspersample.
   - **MONO order up to ~96** (reliable, bit-exact vs reference). Since the faithful mono weight-update
     port (below), high-order mono decodes losslessly on the reference. Default order=64 ≈ preset 4
     (beats it on music). Orders ≥192 still desync (other high-order path, not chased). **STEREO still

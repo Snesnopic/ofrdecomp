@@ -257,13 +257,19 @@ struct AcmEncoder {
 static void put32(std::vector<uint8_t>& o, uint32_t v) { o.push_back(v); o.push_back(v>>8); o.push_back(v>>16); o.push_back(v>>24); }
 static void put16(std::vector<uint8_t>& o, uint16_t v) { o.push_back(v); o.push_back(v>>8); }
 
-bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, std::vector<uint8_t>& file) {
+// sample_type byte for a signed PCM bit depth
+static uint8_t sample_type_for_bps(int bps) {
+    switch (bps) { case 8: return 1; case 16: return 3; case 24: return 5; case 32: return 7; default: return 3; }
+}
+
+bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, int bps, std::vector<uint8_t>& file) {
     crc32_init();
-    int mn = 32767, mx = -32768;
+    int mn = 0x7fffffff, mx = -0x7fffffff - 1;
     for (uint32_t i = 0; i < n; i++) { int v = samples[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
     if (n == 0) { mn = 0; mx = 0; }
     int data_bits = ofr_bitlen(mn, mx);
     int sh = (32 - data_bits) & 0x1f;
+    uint32_t bmask = (bps >= 32) ? 0xffffffffu : ((1u << bps) - 1u);
 
     // chosen params (written into the bitstream, read back by the decoder)
     // mono predictor is now bit-exact vs the reference (faithful FUN_00014e30+FUN_00012ca0,
@@ -280,9 +286,9 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
     if (getenv("OFR_PRED")) PRED = atoi(getenv("OFR_PRED"));   // 1=LPC, 3=cascade
 
     OFR_RangeEncoder enc;
-    // post=1 init (identity)
-    enc.encode_split(16, (uint32_t)mn & 0xffff);
-    enc.encode_split(16, (uint32_t)mx & 0xffff);
+    // post=1 init (identity); split width = bitspersample
+    enc.encode_split((uint32_t)bps, (uint32_t)mn & bmask);
+    enc.encode_split((uint32_t)bps, (uint32_t)mx & bmask);
     enc.encode_bits(1, 0);
 
     static const int IVT[8] = { 32, 64, 128, 256, 512, 1024, 2048, 0 };
@@ -397,7 +403,7 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
     file.push_back('O'); file.push_back('F'); file.push_back('R'); file.push_back(' ');
     put32(file, 17);                          // main size S = 17
     put32(file, n); put16(file, 0);           // total samples (6 bytes)
-    file.push_back(3);                        // sample type SINT16
+    file.push_back(sample_type_for_bps(bps)); // sample type
     file.push_back(0);                        // channel config MONO
     put32(file, samplerate);
     put16(file, 0x2585);                      // encoder ID (informational)
@@ -411,7 +417,7 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
     std::vector<uint8_t> payload;                       // D-4 bytes (everything after CRC field)
     auto p32 = [&](uint32_t v){ payload.push_back(v); payload.push_back(v>>8); payload.push_back(v>>16); payload.push_back(v>>24); };
     p32(n);                                  // number of samples in block
-    payload.push_back(3);                    // sample type
+    payload.push_back(sample_type_for_bps(bps)); // sample type
     payload.push_back(0);                    // channel config
     payload.push_back(reserved & 0xff); payload.push_back(reserved >> 8);
     payload.push_back(0x85);                 // encoder ID byte 0 (decoder skips it)
@@ -428,10 +434,10 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
     return true;
 }
 
-// interleaved L/R 16-bit, pred=1 stereo / ent=1 fast stereo / post=1 identity
-bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t samplerate, std::vector<uint8_t>& file) {
+// interleaved L/R, pred=1/3 stereo / ent=1/2/3 / post=1 identity
+bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t samplerate, int bps, std::vector<uint8_t>& file) {
     crc32_init();
-    int mnL = 32767, mxL = -32768, mnR = 32767, mxR = -32768;
+    int mnL = 0x7fffffff, mxL = -0x7fffffff-1, mnR = 0x7fffffff, mxR = -0x7fffffff-1;
     for (uint32_t i = 0; i < frames; i++) {
         int l = samples[2*i], r = samples[2*i+1];
         if (l < mnL) mnL = l; if (l > mxL) mxL = l;
@@ -441,6 +447,7 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
     int mn = std::min(mnL, mnR), mx = std::max(mxL, mxR);
     int data_bits = ofr_bitlen(mn, mx);
     int sh = (32 - data_bits) & 0x1f;
+    uint32_t bmask = (bps >= 32) ? 0xffffffffu : ((1u << bps) - 1u);
 
     static const int IVT[8] = { 32, 64, 128, 256, 512, 1024, 2048, 0 };
     int OD_IDX = 1, IV_IDX = 0, WPRED = 256, WENT = 16, ENT = 1;   // idx1: max_order=24, right_order=8
@@ -458,9 +465,9 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
     static const int CASC_S2[8] = { 128, 64, 32, 16, 0, 0, 0, 0 };
 
     OFR_RangeEncoder enc;
-    // post=1 init (identity), 2 channels
-    enc.encode_split(16, (uint32_t)mnL & 0xffff); enc.encode_split(16, (uint32_t)mxL & 0xffff); enc.encode_bits(1, 0);
-    enc.encode_split(16, (uint32_t)mnR & 0xffff); enc.encode_split(16, (uint32_t)mxR & 0xffff); enc.encode_bits(1, 0);
+    // post=1 init (identity), 2 channels; split width = bitspersample
+    enc.encode_split((uint32_t)bps, (uint32_t)mnL & bmask); enc.encode_split((uint32_t)bps, (uint32_t)mxL & bmask); enc.encode_bits(1, 0);
+    enc.encode_split((uint32_t)bps, (uint32_t)mnR & bmask); enc.encode_split((uint32_t)bps, (uint32_t)mxR & bmask); enc.encode_bits(1, 0);
     std::vector<int32_t> res(2 * frames);
 
     if (PRED == 3) {
@@ -591,7 +598,7 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
     file.push_back('O'); file.push_back('F'); file.push_back('R'); file.push_back(' ');
     put32(file, 17);
     put32(file, values); put16(file, 0);      // total samples (values)
-    file.push_back(3);                         // SINT16
+    file.push_back(sample_type_for_bps(bps));  // sample type
     file.push_back(1);                         // STEREO_LR
     put32(file, samplerate);
     put16(file, 0x2585); file.push_back(0x02); put16(file, 20);
@@ -601,7 +608,7 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
     std::vector<uint8_t> payload;
     auto p32 = [&](uint32_t v){ payload.push_back(v); payload.push_back(v>>8); payload.push_back(v>>16); payload.push_back(v>>24); };
     p32(values);
-    payload.push_back(3); payload.push_back(1);
+    payload.push_back(sample_type_for_bps(bps)); payload.push_back(1);
     payload.push_back(reserved & 0xff); payload.push_back(reserved >> 8);
     payload.push_back(0x85);
     payload.insert(payload.end(), enc.out.begin(), enc.out.end());
@@ -617,18 +624,29 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
 
 #ifdef OFRENC_MAIN
 int main(int argc, char** argv) {
-    if (argc < 4) { fprintf(stderr, "usage: %s in.raw out.ofr samplerate [channels=1]\n", argv[0]); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: %s in.raw out.ofr samplerate [channels=1] [bps=16]\n", argv[0]); return 2; }
     int ch = (argc >= 5) ? atoi(argv[4]) : 1;
+    int bps = (argc >= 6) ? atoi(argv[5]) : 16;
+    int bytes = bps / 8;
     FILE* f = fopen(argv[1], "rb");
     if (!f) { perror("in"); return 1; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    std::vector<int16_t> s(sz / 2);
-    fread(s.data(), 2, s.size(), f); fclose(f);
+    std::vector<uint8_t> raw(sz);
+    fread(raw.data(), 1, sz, f); fclose(f);
+    uint32_t nvals = (uint32_t)(sz / bytes);
+    std::vector<int32_t> s(nvals);
+    for (uint32_t i = 0; i < nvals; i++) {
+        const uint8_t* p = &raw[(size_t)i * bytes];
+        int32_t v = 0;
+        for (int b = 0; b < bytes; b++) v |= (int32_t)p[b] << (8 * b);
+        int shleft = 32 - bps; v = (v << shleft) >> shleft;   // sign-extend
+        s[i] = v;
+    }
     std::vector<uint8_t> out;
-    if (ch == 2) ofr_encode_stereo16(s.data(), (uint32_t)(s.size() / 2), (uint32_t)atoi(argv[3]), out);
-    else ofr_encode_mono16(s.data(), (uint32_t)s.size(), (uint32_t)atoi(argv[3]), out);
+    if (ch == 2) ofr_encode_stereo(s.data(), nvals / 2, (uint32_t)atoi(argv[3]), bps, out);
+    else ofr_encode_mono(s.data(), nvals, (uint32_t)atoi(argv[3]), bps, out);
     FILE* g = fopen(argv[2], "wb"); fwrite(out.data(), 1, out.size(), g); fclose(g);
-    fprintf(stderr, "wrote %zu bytes (ch=%d)\n", out.size(), ch);
+    fprintf(stderr, "wrote %zu bytes (ch=%d bps=%d)\n", out.size(), ch, bps);
     return 0;
 }
 #endif

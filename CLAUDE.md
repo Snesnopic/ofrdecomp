@@ -95,7 +95,14 @@ transform flag `obj+0x9a`==1 — triggered by tonal/synthetic signals (pure sine
 
 ## Next work (ordered by cost)
 
-1. **pred_type=3** (presets 4→max, the high-ratio "new" modes) — biggest piece, the main remaining predictor.
+1. **pred_type=3** (presets 4→max) — IN PROGRESS, fully reverse-engineered. **See `doc/pred3_analysis.md`
+   for the complete function-by-function map** (object layout, decode loop, cascade NLMS predict/update,
+   stage FIR, final combiner, and the init that reads params + decodes the entropy-coded segment schedule).
+   It is a DUAL predictor: standard LPC (object+0x10, same as pred=1) + a secondary **cascade of float32
+   NLMS adaptive filters** (object+0x42c60), alternating per segment via an entropy-coded schedule (0x437b8).
+   All ~15 helper functions decompiled. Main implementation risks: float32 bit-exactness (compile that TU
+   WITHOUT -ffast-math, keep the ×8 / 4-accumulator unroll order), and decoding the embedded schedule with
+   the existing adaptive-tree context code. This is the single largest remaining component.
 2. **entropy_type=3** (preset max, acm).
 3. **post_type=2 value-remap table** (only for tonal signals).
 4. Encoder (not started).

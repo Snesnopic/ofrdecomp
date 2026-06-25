@@ -1,0 +1,85 @@
+# pred_type=3 — cascade NLMS predictor (presets 4→max)
+
+Full RE map of the high-compression predictor. Mono object base offsets shown (param_1[0x11]);
+stereo (param_1[0x12]) mirrors at 0x67xxx with two channels + cc alternation.
+
+## Object layout (mono pred=3, base = object)
+- `+0x10`   : standard LPC predictor (same struct/funcs as pred=1: predict `FUN_00014ce0`, update `FUN_00015100`, init `FUN_00014dc0`)
+- `+0x42c60`: secondary **cascade NLMS** predictor (predict `FUN_0000edc0`, update `FUN_0000eee0`, init `FUN_0000ece0`)
+- `+0x43680`: main LPC weight_param   `+0x43684`: main order   `+0x43688`: main interval
+- `+0x4368c`/`0x43690`: min/max   `+0x43694`: shift (32-databits)   `+0x43698`: progress counter (0xac44)
+- `+0x4369c`: need_init flag   `+0x436a0`: progress cb   `+0x436a8`: total block samples
+- `+0x436ac`: cc segment length (= main interval)   `+0x436b0`: current mode (0=LPC,1=cascade)
+- `+0x436b4`: cc countdown   `+0x436b8`: schedule index   `+0x437b8[]`: per-segment type schedule (bytes)
+- cascade param block (read by init, consumed by `FUN_0000ece0`):
+  - `+0x437a0`: nStages (+1)   `+0x437a4`: cascade final weight_param   `+0x437a8`: 1<<k size
+  - `+0x437ac`: golomb count   `+0x43798`: a double scale (0x436c0-area mu's)   `+0x43750+i*4`: per-stage order
+  - `+0x436c0+i*8`: per-stage mu (double)   `+0x43708+i*8`: per-stage clamp
+  - NOTE: `FUN_0000ece0` reads its inputs from a param struct at object+0x436c0 region (offsets 0xd8/0xe0/0xe4/0xe8/0xec, and per-stage 0x8/0x48/0x90).
+
+## Decode loop (`FUN_00008590` mono)
+On need_init: init main LPC (`FUN_00014dc0`), init cascade (`FUN_0000ece0`), counter=0xac44.
+Per sample i:
+- progress countdown.
+- if cc countdown(0x436b4)==1: set a flag 0x42c50 from schedule[idx].
+- mode = 0x436b0:
+  - mode 0 (LPC): p=round(FUN_00014ce0); clamp[min,max]; out=((clamp+res)<<sh)>>sh; update main(out);
+    then `FUN_0000edc0(cc)` (advance cascade), `FUN_0000eee0(out, cc)` (train cascade on out).
+  - mode 1 (cascade): p=FUN_0000edc0(cc) (returns int already rounded); clamp; out=((clamp+res)<<sh)>>sh;
+    `FUN_0000eee0(out, cc)`; update main(out).
+- cc countdown--; on 0: mode=schedule[idx], countdown=0x436ac, idx++.
+
+## Cascade predict `FUN_0000edc0(cc)` → int
+cc has N stages (count at cc+0xa18). cumulative array at cc+0x9c8.
+For stage s=1..N: advance ring (cc+0x850+s*0x18), zero new slot, stagePred=`FUN_0000f850`(weights cc+0x6e8+s*0x28, hist);
+  store at cc+0x938+s*8; cumsum[s] = stagePred + cumsum[s-1].
+Final = `FUN_000154e0`(cc, &cumsum[N+1]) + bias(cc+0x928). Return round(final).
+
+## Cascade update `FUN_0000eee0(actual, cc)`
+err = actual - bias(cc+0x928); bias = actual * decay(cc+0x930).  (cc+0x980 = err)
+For stage s=1..N: err -= stagePred[s] (cc+0x938+s*8); store cc+0x980+s*8;
+  `FUN_0000f8c0`(err_float, stage cc+0x6e8+s*0x28, ringptr cc+0x850+s*0x18)  ← NLMS weight update;
+  ring head = prev err (cc+0x980+(s-1)*8).
+cumsum-tail = err; `FUN_00015890`(cc, &cc+0x9d0+N*8)  ← final combiner update.
+
+## Stage predict `FUN_0000f850(stage, histptr)` → double (FIR dot, float32)
+size=stage[1]; w=stage[0]; h=histptr - size*4(float). sum over i: h[i]*w[i], unrolled ×8 (4 accumulators).
+Returns (double)acc8+acc7+acc6+acc5.  ALL FLOAT32 multiply/add.
+
+## Stage NLMS update `FUN_0000f8c0(res_float, stage, histptr)`
+stage[0]=weights, [1]=size, [2]=energy(double via long bits), [3]=mu(double), [4]=eps(double).
+energy = h[-1]² + (energy - h[~size]²)   (sliding window energy, float² → double)
+step = (res * mu) / (energy + eps)    (double, then →float)
+for i in 0..size: w[i] += hist[i]*step   (float32, unrolled ×8).
+
+## Final combiner predict `FUN_000154e0(cc, &cumsum_end)` → double
+size=cc[2](int at cc+8); coefs at cc+0x268. dot: sum cumsum[-(i+1)] * coefs[i], double.
+
+## Final combiner update `FUN_00015890(cc, dptr)`  (NLMS over the cumsum history, double)
+cc+0 = counter++; cc+2=size; cc+6=decay; cc+8.. inner coef matrix; halve via FUN_00015570 when counter exceeds.
+
+## Init `FUN_000077d0` (vtable[0], reads from RC = param_2)
+1. main LPC: weight(12b, 0xfff→16b+0x1001 else +2), interval(3b, table DAT_21ca0 / 7→16b+1), order(5b, table DAT_21cd0 / 0x1f→8b+1). → 0x43680/0x43688/0x43684.
+2. cascade: nStages=3b+1 (0x437a0); 0x43798 = read (1b flag; if set 10b/DAT_19718 scale else 1.0);
+   0x437a4=12b weight+2; 0x437a8=1<<(3b); 0x437ac=golomb-ish (1b; if set 16b);
+   per stage s=1..nStages: order = 5b (table DAT_21ea2*4+4 / 0x1f→8b*4+4) → 0x43750+s*4;
+     mu = 10b / DAT_19688 → 0x436c0+s*8.
+3. 0x436ac = main interval. per-stage clamp init at 0x43708 (from |min|,|max|).
+4. SCHEDULE: a separate adaptive entropy ctx (local_40, FUN_0000fb90(.,2,2,0x8000)) decodes the
+   per-segment type array into 0x437b8[]: nSegments = (totalSamples + ~min(order+1,total) + interval)/interval.
+   First entry decoded with a 2-symbol ctx; rest in a loop. 0x437b8[nSeg]=1 (sentinel).
+5. 0x436b4 = min(order+1, total); 0x436b0 = schedule[0]; 0x436b8=1; 0x4369c=1.
+
+## Implementation risks
+- **float32 exactness**: stages use float multiply/accumulate with SSE ×8 unrolling. `-ffast-math` will
+  break this (contraction/reordering). Compile this TU without fast-math; replicate the 4-accumulator
+  unrolled order exactly; use `float` not double for stage ops.
+- The embedded entropy-coded schedule must be decoded with the exact same adaptive tree as the binary
+  (FUN_0000fb90/FUN_00002df0 — same family already ported for fast-stereo entropy contexts).
+- Stereo pred=3 adds L/R + cc cross-channel alternation on top (object 0x67xxx).
+
+## Helper functions to port
+predict: FUN_0000edc0, FUN_0000f850, FUN_000154e0
+update:  FUN_0000eee0, FUN_0000f8c0, FUN_00015890, FUN_00015570(halve)
+init:    FUN_000077d0(params+schedule), FUN_0000ece0(cascade), FUN_0000e850(stage alloc), FUN_0000f760(ring), FUN_00015830(final)
+context: FUN_0000fb90/FUN_00002bd0/FUN_00002df0/FUN_00002ea0 (already have equivalents in entropy fast path)

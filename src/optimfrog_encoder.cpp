@@ -110,6 +110,55 @@ struct FastEntropyEncoder {
     }
 };
 
+// ---- slow entropy encoder (dual of OFR_EntropyDecoder::decode_one_sample, FUN_00109ab0) ----
+static inline int floor_log2_u(uint32_t x) { return 31 - __builtin_clz(x); }
+struct SlowEntropyEncoder {
+    OFR_ModelContext master;   // 32-symbol tree (leaves == num_nodes == 32), increment 2
+    double weight = 0, weight2 = 0;
+    uint32_t bit_depth = 0;
+    void init(uint32_t bd, uint32_t w) {
+        weight = (double)(w - 1) / (double)w;
+        weight2 = 1.0 / (double)w;
+        bit_depth = bd;
+        master.init(32u, 0x8000u);
+    }
+    void encode_sample(OFR_RangeEncoder& enc, double& var, int32_t residual) {
+        uint32_t raw_val = (residual >= 0) ? ((uint32_t)residual << 1) : (((uint32_t)(-residual) << 1) - 1u);
+        uint32_t uVar6 = ((uint32_t)(int64_t)var >> 2) & 0x3fffffffu;
+        uint32_t uVar16 = uVar6 + 1u;
+        bool escape = false;
+        if (uVar16 < 0x4001u) {
+            uint32_t q = raw_val / uVar16;
+            if (q < 31u) {
+                enc.encode_symbol(master, q);
+                enc.encode_uniform(uVar16, raw_val - q * uVar16);
+            } else {
+                enc.encode_symbol(master, 31u);
+                uVar16 = uVar16 * 31u; escape = true;
+            }
+        } else {
+            int iVar14 = floor_log2_u(uVar16);
+            uint32_t sym2 = raw_val >> iVar14;
+            if (sym2 < 31u) {
+                enc.encode_symbol(master, sym2);
+                enc.encode_bits((uint32_t)iVar14, raw_val & ((1u << iVar14) - 1u));
+            } else {
+                enc.encode_symbol(master, 31u);
+                uVar16 = 0x1fu << iVar14; escape = true;
+            }
+        }
+        if (escape) {
+            int new_bits = floor_log2_u(uVar16);
+            uint32_t remaining = bit_depth - (uint32_t)new_bits;
+            int total_bits = floor_log2_u(raw_val);
+            enc.encode_uniform(remaining, (uint32_t)(total_bits - new_bits));
+            enc.encode_bits((uint32_t)total_bits, raw_val - (1u << total_bits));
+        }
+        uint32_t var_raw = (raw_val > 0x3fffffffu) ? 0x3fffffffu : raw_val;
+        var = var * weight + (double)var_raw * weight2;
+    }
+};
+
 static void put32(std::vector<uint8_t>& o, uint32_t v) { o.push_back(v); o.push_back(v>>8); o.push_back(v>>16); o.push_back(v>>24); }
 static void put16(std::vector<uint8_t>& o, uint16_t v) { o.push_back(v); o.push_back(v>>8); }
 
@@ -125,11 +174,12 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
     // mono predictor is now bit-exact vs the reference (faithful FUN_00014e30+FUN_00012ca0,
     // compiled -fno-fast-math): orders up to ~96 decode losslessly on the reference. order 64
     // ≈ reference preset 4. interval 32 = table index 0.
-    int ORDER = 64, INTERVAL = 32, WPRED = 256, WENT = 16;
+    int ORDER = 64, INTERVAL = 32, WPRED = 256, WENT = 16, ENT = 1;
     if (getenv("OFR_ORDER")) ORDER = atoi(getenv("OFR_ORDER"));
     if (getenv("OFR_INTERVAL")) INTERVAL = atoi(getenv("OFR_INTERVAL"));
     if (getenv("OFR_WPRED")) WPRED = atoi(getenv("OFR_WPRED"));
     if (getenv("OFR_WENT")) WENT = atoi(getenv("OFR_WENT"));
+    if (getenv("OFR_ENT")) ENT = atoi(getenv("OFR_ENT"));   // 1=fast, 2=slow
 
     OFR_RangeEncoder enc;
     // post=1 init (identity)
@@ -163,11 +213,16 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
         pd.update((double)v);
     }
 
-    // entropy encode residuals
-    FastEntropyEncoder ent;
-    ent.init((uint32_t)data_bits, (uint32_t)WENT);
-    double var = 1.0;
-    for (uint32_t i = 0; i < n; i++) ent.encode_sample(enc, var, res[i]);
+    // entropy encode residuals (fast = ent1, slow = ent2)
+    if (ENT == 2) {
+        SlowEntropyEncoder ent; ent.init((uint32_t)data_bits, (uint32_t)WENT);
+        double var = 0.0;   // slow path variance starts at 0.0
+        for (uint32_t i = 0; i < n; i++) ent.encode_sample(enc, var, res[i]);
+    } else {
+        FastEntropyEncoder ent; ent.init((uint32_t)data_bits, (uint32_t)WENT);
+        double var = 1.0;
+        for (uint32_t i = 0; i < n; i++) ent.encode_sample(enc, var, res[i]);
+    }
     enc.flush();
 
     // ---- assemble file ----
@@ -186,7 +241,7 @@ bool ofr_encode_mono16(const int16_t* samples, uint32_t n, uint32_t samplerate, 
     file.push_back('H'); file.push_back('E'); file.push_back('A'); file.push_back('D');
     put32(file, 0);
     // COMP block
-    uint16_t reserved = (1u << 11) | (1u << 6) | 1u;   // ent=1, pred=1, post=1
+    uint16_t reserved = ((uint16_t)ENT << 11) | (1u << 6) | 1u;   // ent, pred=1, post=1
     std::vector<uint8_t> payload;                       // D-4 bytes (everything after CRC field)
     auto p32 = [&](uint32_t v){ payload.push_back(v); payload.push_back(v>>8); payload.push_back(v>>16); payload.push_back(v>>24); };
     p32(n);                                  // number of samples in block
@@ -222,11 +277,12 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
     int sh = (32 - data_bits) & 0x1f;
 
     static const int IVT[8] = { 32, 64, 128, 256, 512, 1024, 2048, 0 };
-    int OD_IDX = 1, IV_IDX = 0, WPRED = 256, WENT = 16;   // idx1: max_order=24, right_order=8
+    int OD_IDX = 1, IV_IDX = 0, WPRED = 256, WENT = 16, ENT = 1;   // idx1: max_order=24, right_order=8
     if (getenv("OFR_ODIDX")) OD_IDX = atoi(getenv("OFR_ODIDX"));
     if (getenv("OFR_IVIDX")) IV_IDX = atoi(getenv("OFR_IVIDX"));
     if (getenv("OFR_WPRED")) WPRED = atoi(getenv("OFR_WPRED"));
     if (getenv("OFR_WENT")) WENT = atoi(getenv("OFR_WENT"));
+    if (getenv("OFR_ENT")) ENT = atoi(getenv("OFR_ENT"));   // 1=fast, 2=slow
     int max_order = DAT_00326220[OD_IDX];
     int right_order = DAT_00326200[OD_IDX];
     int interval = IVT[IV_IDX];
@@ -258,13 +314,21 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
         inner.updateRight((double)R);
     }
 
-    // entropy encode (interleaved L/R, two variances, shared contexts)
-    FastEntropyEncoder ent;
-    ent.init((uint32_t)data_bits, (uint32_t)WENT);
-    double var_L = 1.0, var_R = 1.0;
-    for (uint32_t i = 0; i < 2 * frames; i += 2) {
-        ent.encode_sample(enc, var_L, res[i]);
-        ent.encode_sample(enc, var_R, res[i+1]);
+    // entropy encode (interleaved L/R, two variances)
+    if (ENT == 2) {
+        SlowEntropyEncoder ent; ent.init((uint32_t)data_bits, (uint32_t)WENT);
+        double var_L = 0.0, var_R = 0.0;
+        for (uint32_t i = 0; i < 2 * frames; i += 2) {
+            ent.encode_sample(enc, var_L, res[i]);
+            ent.encode_sample(enc, var_R, res[i+1]);
+        }
+    } else {
+        FastEntropyEncoder ent; ent.init((uint32_t)data_bits, (uint32_t)WENT);   // shared contexts
+        double var_L = 1.0, var_R = 1.0;
+        for (uint32_t i = 0; i < 2 * frames; i += 2) {
+            ent.encode_sample(enc, var_L, res[i]);
+            ent.encode_sample(enc, var_R, res[i+1]);
+        }
     }
     enc.flush();
 
@@ -279,7 +343,7 @@ bool ofr_encode_stereo16(const int16_t* samples, uint32_t frames, uint32_t sampl
     put16(file, 0x2585); file.push_back(0x02); put16(file, 20);
     file.push_back('H'); file.push_back('E'); file.push_back('A'); file.push_back('D');
     put32(file, 0);
-    uint16_t reserved = (1u << 11) | (1u << 6) | 1u;
+    uint16_t reserved = ((uint16_t)ENT << 11) | (1u << 6) | 1u;
     std::vector<uint8_t> payload;
     auto p32 = [&](uint32_t v){ payload.push_back(v); payload.push_back(v>>8); payload.push_back(v>>16); payload.push_back(v>>24); };
     p32(values);

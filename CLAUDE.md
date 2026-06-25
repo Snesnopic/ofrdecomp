@@ -111,9 +111,13 @@ reference encoder's choices, only be valid and self-consistent.
     desyncs vs the reference. Residual = `((sample - clamp(round(predict()))) << sh) >> sh` (wrap to
     data_bits, sh=(32-data_bits)&0x1f), then `update(sample)`. Reuses `OFR_Predictor`.
   - entropy init dual: `uniform(4096, w-2)` (read_12bit_value dual) → weight=(w-1)/w, weight2=1/w.
-    Fast entropy encoder = exact dual of `fast_decode_sample`: zigzag(residual) → symbol/group/extra,
-    tree walk + freq +2, var update. Contexts sized by data_bits (`num_contexts=2*data_bits`,
-    `per_symbols=data_bits<4?1<<d:d*8-0x10`).
+    Fast entropy (ent=1) encoder = exact dual of `fast_decode_sample`: zigzag(residual) →
+    symbol/group/extra, tree walk + freq +2, var update. Contexts sized by data_bits.
+  - **ent=2 (slow) encoder** (`SlowEntropyEncoder`, dual of `decode_one_sample`/`FUN_00109ab0`): 32-symbol
+    master tree (reuse `OFR_ModelContext(32,0x8000)` + `encode_symbol`), `decode_abs_bits` dual ==
+    `encode_bits`, the var-driven multi-branch raw_val split (fast `q=raw/uVar16`, bit-width
+    `sym2=raw>>iVar14`, escape via `floor_log2`), variance starts at **0.0**. Verified mono+stereo vs
+    reference. Both ent=1 and ent=2 selectable (the reference uses ent=2 for presets 0-3).
   - **MONO order up to ~96** (reliable, bit-exact vs reference). Since the faithful mono weight-update
     port (below), high-order mono decodes losslessly on the reference. Default order=64 ≈ preset 4
     (beats it on music). Orders ≥192 still desync (other high-order path, not chased). **STEREO still

@@ -235,15 +235,15 @@ flag). Removing the spurious flag-set closed ramp/square/multitone (L==R singula
 (L≠R tonal) stereo. Also fixed the matching encoder direction-B failures (encoder reuses the predictor).
 `predictLeft/Right` were also made the exact binary 2-accumulator pairwise FIR (FUN_00012ed0/12f90).
 
-**Remaining decoder gap (suite: PASS=554 FAIL=6 — ALL corpus2 only).** One real-music file, block 7
-(pred=1/ent=2/post=2): block 7 frame 0 is bit-exact, frame 1 diverges. At frame 1 the predictor uses
-init weights so predict = history (exact) → the divergence is in the **ent=2 (slow) entropy**: L
-residual off by 1 at sample 2, then a full range-coder desync. Other ent=2 blocks decode fine, so it's
-a ~1-ULP slow-entropy edge on block 7's content — likely a `(int64_t)var` truncation flipping the
-variance-exponent branch in `decode_one_sample`. Next step: LLDB-compare the slow-entropy decoded
-residuals / variance at block 7 samples 0-3.
-Verified-good: ALL synthetic stereo (degenerate/tonal/boundary), 7/8 real corpus, all mono, all
-encoder direction-B.
+**Decoder gaps CLOSED — conformance suite PASS=560 FAIL=0** (8 real corpus + 87 synthetic ×
+presets {0,2,4,7,10,max}, both directions). The last gap (corpus2 block 7, pred=1/ent=2/post=2) was a
+**1-ULP slow-entropy bug**: the reference derives `weight2 = 1.0 - weight` (weight=(w-1)/w), which is
+1 ULP below `1.0/w`. We used `1.0/w`. On block 7 sample 0 the variance update `0*weight + 6320*weight2`
+gives EXACTLY 80.0 with `1/w` but `79.99999999999973` with `1-weight`; the `(int64_t)var` truncation
+in `decode_one_sample` then yields `uVar16=21` vs the correct `20`, flipping the variance-exponent
+branch → off-by-one residual → full range-coder desync from frame 1. Found by LLDB-comparing the
+binary's slow-entropy `var`/`raw_val`/`uVar16` (dylib slow entropy = `FUN_005?` at file offset 0x57f0;
+variance update at 0x5e2d-0x5e48 is linear `var*W1 + raw*W2`). Fix in `init_from_bitstream`.
 
 ## Next work (ordered by cost)
 

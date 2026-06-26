@@ -705,7 +705,6 @@ void OFR_PredictorStereo_Inner::solveCholeskyLeft() {
     }
 
     if (!OFR_SolveLDLT(&m_temp_matrix[0][0], m_left_coefs, m_temp_vector, m_max_order)) {
-        m_is_cholesky_fail_left = 1;
         // two-stage singular fallback (FUN_00013310): zero coefs; a single tap with R[0]==R[2i+2];
         // else rebuild the left-only (mono) block of left_order and re-solve; else coef0=1.
         for (int i = 0; i < m_max_order; ++i) m_left_coefs[i] = 0.0;
@@ -809,7 +808,6 @@ void OFR_PredictorStereo_Inner::solveCholeskyRight() {
     }
 
     if (!OFR_SolveLDLT(&m_temp_matrix[0][0], m_right_coefs, m_temp_vector, m_max_order)) {
-        m_is_cholesky_fail_right = 1;
         // two-stage singular fallback (FUN_00013bf0): mirror of the left, using right history /
         // right autocorr, block size = left_order (the cross-channel primary block size).
         for (int i = 0; i < m_max_order; ++i) m_right_coefs[i] = 0.0;

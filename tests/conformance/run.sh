@@ -36,13 +36,13 @@ rtry_out() { local out="$1"; shift; local i; for i in 1 2 3; do rm -f "$out"; "$
 refdec() { rtry_out "$2" env DYLD_LIBRARY_PATH="$DYLIBDIR" "$REFGEN" "$1" "$2"; }
 ourdec() { rm -f "$WORK/tmp/test.raw"; local i; for i in 1 2 3; do ( cd "$WORK/tmp" && "$ODEC" "$1" >/dev/null 2>&1 ); [ -s "$WORK/tmp/test.raw" ] && { cp -f "$WORK/tmp/test.raw" "$2"; return 0; }; done; return 1; }
 
-# direction A: reference encode (all presets) -> ref + our decode -> must equal original
+# direction A: reference encode (per preset) -> ref + our decode -> must equal original
 dirA() {
-  local raw="$1" ch="$2" bps="$3" rate="$4" tag="$5"
+  local raw="$1" ch="$2" bps="$3" rate="$4" tag="$5" plist="$6"
   local st cc; st=$(st_of "$bps"); cc=$(cc_of "$ch")
-  for p in $PRESETS; do
+  for p in $plist; do
     local of="$WORK/tmp/a.ofr" rr="$WORK/tmp/a_ref.raw" ro="$WORK/tmp/a_our.raw"
-    rtry_out "$of" "$OFR" --encode --raw --channelconfig "$cc" --sampletype "$st" --rate "$rate" "$raw" --output "$of"
+    rtry_out "$of" "$OFR" --preset "$p" --encode --raw --channelconfig "$cc" --sampletype "$st" --rate "$rate" "$raw" --output "$of"
     if [ ! -s "$of" ]; then note "A enc $tag p$p (no ofr output)"; continue; fi
     refdec "$of" "$rr"
     if ! cmp -s "$raw" "$rr"; then note "A ref-decode $tag p$p (ref != original)"; else ok; fi
@@ -70,8 +70,8 @@ dirB() {
   done
 }
 
-run_raw() { # path ch bps rate tag
-  dirA "$1" "$2" "$3" "$4" "$5"
+run_raw() { # path ch bps rate tag plist
+  dirA "$1" "$2" "$3" "$4" "$5" "$6"
   dirB "$1" "$2" "$3" "$4" "$5"
 }
 
@@ -92,7 +92,18 @@ if [ -d "$CORPUS" ]; then
 fi
 echo "corpus raws: $i ; synthetic: $(ls "$WORK/synth" | wc -l | tr -d ' ')"
 
-echo "=== running (presets: $PRESETS ; bps: $BPSLIST) ==="
+# SYNTH_PRESETS: applied to small synthetic files (cheap → exhaustive).
+# CORPUS_PRESETS: applied to large real-audio files. HEAVYPRESETS (slow) are
+# only run on the first HEAVYN corpus files to bound wall-clock.
+SYNTH_PRESETS="${SYNTH_PRESETS:-$PRESETS}"
+CORPUS_PRESETS="${CORPUS_PRESETS:-$PRESETS}"
+HEAVYPRESETS="${HEAVYPRESETS:-10 max}"
+HEAVYN="${HEAVYN:-9999}"
+
+is_heavy() { case " $HEAVYPRESETS " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+echo "=== running (synth: $SYNTH_PRESETS ; corpus: $CORPUS_PRESETS heavy[$HEAVYPRESETS]<=${HEAVYN}f ; bps: $BPSLIST) ==="
+ci=0
 for bps in $BPSLIST; do
   for r in "$WORK"/synth/*__*bps.raw "$WORK"/raw/*__*bps.raw; do
     [ -f "$r" ] || continue
@@ -100,7 +111,16 @@ for bps in $BPSLIST; do
     fbps=$(echo "$base" | sed -E 's/.*__([0-9]+)bps\.raw/\1/')
     [ "$fbps" = "$bps" ] || continue
     fch=$(echo "$base" | sed -E 's/.*__([0-9]+)ch__.*/\1/')
-    run_raw "$r" "$fch" "$bps" 44100 "$base"
+    case "$r" in
+      */raw/*)  # corpus: drop heavy presets past HEAVYN files
+        plist=""; for p in $CORPUS_PRESETS; do
+          if is_heavy "$p" && [ "$ci" -ge "$HEAVYN" ]; then continue; fi
+          plist="$plist $p"
+        done
+        ci=$((ci+1));;
+      *) plist="$SYNTH_PRESETS";;
+    esac
+    run_raw "$r" "$fch" "$bps" 44100 "$base" "$plist"
   done
 done
 

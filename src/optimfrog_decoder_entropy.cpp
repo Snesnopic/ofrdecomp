@@ -5,6 +5,8 @@
 #include <cstring>
 #include <iostream>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 
 // ============================================================
 // OFR_ModelContext  (mirrors binary's "segment tree" context)
@@ -85,7 +87,7 @@ void OFR_EntropyDecoder::halve_master() {
 void OFR_EntropyDecoder::init_from_bitstream(OFR_RangeCoder* rc) {
     uint32_t w = rc->read_12bit_value();
     weight  = (double)(w - 1) / (double)w;
-    weight2 = 1.0 / (double)w;
+    weight2 = 1.0 - weight;   // binary derives weight2 from weight (1-ULP off vs 1/w)
     decoded_samples = 0;
     needs_init = true;
 }
@@ -221,11 +223,8 @@ int32_t OFR_EntropyDecoder::decode_one_sample(double& var, OFR_RangeCoder* rc) {
     uint32_t uVar6 = ((uint32_t)var_int >> 2) & 0x3fffffffu;
     uint32_t uVar16 = uVar6 + 1u;
 
-    static int dbg_count = 0;
-    if (dbg_count++ < 5) {
-    }
     if (uVar16 < 0x4001u) {
-        int sym = decode_tree_symbol(
+                int sym = decode_tree_symbol(
             master_freqs, master_num_nodes, master_num_symbols,
             master_total_freq, master_limit, rc, 2);
 

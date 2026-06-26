@@ -426,26 +426,38 @@ void OFR_PredictorStereo_Inner::init(double weight, int max_order, int left_orde
     m_right_coefs[0] = 1.0;
 }
 
+// FUN_00012ed0/00012f90: 2-accumulator pairwise FIR (4 taps/iter: a6<-taps0,1 a7<-taps2,3, each
+// pair grouped (h0*c0+h1*c1)+acc), return a7+a6. Float op-order matters — a sequential single-acc
+// sum diverges 1 ULP and lrint() then rounds to ±1 on borderline predictions. All pred=1 stereo
+// orders are multiples of 4 (DAT tables) → no padding/over-read.
 double OFR_PredictorStereo_Inner::predictLeft() {
-    double sum = 0.0;
-    for (int i = 0; i < m_left_order; ++i) {
-        sum += m_left_hist_ptr[i] * m_left_coefs[i];
+    double a6 = 0.0, a7 = 0.0;
+    const double* h = m_left_hist_ptr; const double* c = m_left_coefs;
+    for (int n = 0; n < m_left_order; n += 4) {
+        a6 = (h[n]*c[n] + h[n+1]*c[n+1]) + a6;
+        a7 = (h[n+2]*c[n+2] + h[n+3]*c[n+3]) + a7;
     }
-    for (int i = 0; i < m_right_order; ++i) {
-        sum += m_right_hist_ptr[i] * m_left_coefs[m_left_order + i];
+    h = m_right_hist_ptr; c = m_left_coefs + m_left_order;
+    for (int n = 0; n < m_right_order; n += 4) {
+        a6 = (h[n]*c[n] + h[n+1]*c[n+1]) + a6;
+        a7 = (h[n+2]*c[n+2] + h[n+3]*c[n+3]) + a7;
     }
-    return sum;
+    return a7 + a6;
 }
 
 double OFR_PredictorStereo_Inner::predictRight() {
-    double sum = 0.0;
-    for (int i = 0; i < m_left_order; ++i) {
-        sum += m_right_hist_ptr[i] * m_right_coefs[i];
+    double a6 = 0.0, a7 = 0.0;
+    const double* h = m_right_hist_ptr; const double* c = m_right_coefs;
+    for (int n = 0; n < m_left_order; n += 4) {   // first block count = left_order
+        a6 = (h[n]*c[n] + h[n+1]*c[n+1]) + a6;
+        a7 = (h[n+2]*c[n+2] + h[n+3]*c[n+3]) + a7;
     }
-    for (int i = 0; i < m_right_order; ++i) {
-        sum += m_left_hist_ptr[i] * m_right_coefs[m_left_order + i];
+    h = m_left_hist_ptr; c = m_right_coefs + m_left_order;
+    for (int n = 0; n < m_right_order; n += 4) {
+        a6 = (h[n]*c[n] + h[n+1]*c[n+1]) + a6;
+        a7 = (h[n+2]*c[n+2] + h[n+3]*c[n+3]) + a7;
     }
-    return sum;
+    return a7 + a6;
 }
 
 void OFR_PredictorStereo_Inner::updateAutocorrLeft() {

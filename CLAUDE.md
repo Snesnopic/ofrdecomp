@@ -227,22 +227,23 @@ The earlier "100%" was an over-claim from the narrow matrix. The suite found and
 - Stereo two-stage singular fallback ported (`FUN_00013310`/`FUN_00013bf0`): impulse/fullscale stereo
   now bit-exact.
 
-**Remaining decoder gaps (suite-tracked: PASS=504 FAIL=56). ALL failures are STEREO with post=2 the
-active value-remap. Real non-tonal music (remap inactive) + ALL mono = bit-exact.** Two sub-classes,
-both ~1-ULP numerical-faithfulness of the stereo predictor on the *remapped* (dense-index) signal
-(the same class as the original mono-ramp gap, now in the stereo+post=2 path; the predictor TU is
-already -fno-fast-math, so the residual is op-ordering in the stereo predict/weight-update):
-1. **L==R singular** (ramp/square/multitone stereo): cross-channel covariance is rank-deficient; the
-   two-stage fallback (ported) handles the first singular update but a *later* one still diverges
-   (e.g. ramp @frame 2769).
-2. **L≠R tonal** (len1023/1024/1025, corpus2's tonal block): a stereo weight-update on the remapped
-   data yields 1-ULP-off weights → `lrint(predictRight())` rounds to a steady **+1** on the R channel
-   (e.g. len1024 R = ref+1 from frame 285; L exact). `predictLeft/Right` are now the exact binary
-   2-accumulator pairwise FIR (FUN_00012ed0/12f90) — that didn't close it, so the residual 1-ULP is
-   in the **weights** (`solveCholeskyRight` construction/solve, FUN_00013bf0+FUN_00012ca0). Next step:
-   LLDB-compare our `m_right_coefs` to the binary's at the first divergent weight-update.
-Verified-good: impulse/fullscale stereo (two-stage fallback), sine/dc/silence/noise/nearzero stereo,
-all mono, real multi-block music.
+**Stereo degenerate/tonal — FIXED.** LLDB comparison of our `m_right_coefs` vs the binary found the
+real bug: the reference re-solves the stereo weights every interval (count=145,273,401…) but ours did
+ONE solve then froze — because `solveCholeskyLeft/Right` set `m_is_cholesky_fail_*=1` in the singular
+fallback and `updateLeft/Right` gate re-solves on `!m_is_cholesky_fail` (FUN_00013bf0 never sets that
+flag). Removing the spurious flag-set closed ramp/square/multitone (L==R singular) AND len1023/1024/1025
+(L≠R tonal) stereo. Also fixed the matching encoder direction-B failures (encoder reuses the predictor).
+`predictLeft/Right` were also made the exact binary 2-accumulator pairwise FIR (FUN_00012ed0/12f90).
+
+**Remaining decoder gap (suite: PASS=554 FAIL=6 — ALL corpus2 only).** One real-music file, block 7
+(pred=1/ent=2/post=2): block 7 frame 0 is bit-exact, frame 1 diverges. At frame 1 the predictor uses
+init weights so predict = history (exact) → the divergence is in the **ent=2 (slow) entropy**: L
+residual off by 1 at sample 2, then a full range-coder desync. Other ent=2 blocks decode fine, so it's
+a ~1-ULP slow-entropy edge on block 7's content — likely a `(int64_t)var` truncation flipping the
+variance-exponent branch in `decode_one_sample`. Next step: LLDB-compare the slow-entropy decoded
+residuals / variance at block 7 samples 0-3.
+Verified-good: ALL synthetic stereo (degenerate/tonal/boundary), 7/8 real corpus, all mono, all
+encoder direction-B.
 
 ## Next work (ordered by cost)
 

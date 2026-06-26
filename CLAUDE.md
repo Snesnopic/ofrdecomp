@@ -237,8 +237,10 @@ already -fno-fast-math, so the residual is op-ordering in the stereo predict/wei
    (e.g. ramp @frame 2769).
 2. **L≠R tonal** (len1023/1024/1025, corpus2's tonal block): a stereo weight-update on the remapped
    data yields 1-ULP-off weights → `lrint(predictRight())` rounds to a steady **+1** on the R channel
-   (e.g. len1024 R = ref+1 from frame 285; L exact). Need predictRight/updateRight/solveCholesky float
-   op-order bit-exact to the binary (cf. how the mono ramp needed the exact FUN_00012ca0 order).
+   (e.g. len1024 R = ref+1 from frame 285; L exact). `predictLeft/Right` are now the exact binary
+   2-accumulator pairwise FIR (FUN_00012ed0/12f90) — that didn't close it, so the residual 1-ULP is
+   in the **weights** (`solveCholeskyRight` construction/solve, FUN_00013bf0+FUN_00012ca0). Next step:
+   LLDB-compare our `m_right_coefs` to the binary's at the first divergent weight-update.
 Verified-good: impulse/fullscale stereo (two-stage fallback), sine/dc/silence/noise/nearzero stereo,
 all mono, real multi-block music.
 

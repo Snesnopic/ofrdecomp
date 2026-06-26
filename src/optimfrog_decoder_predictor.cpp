@@ -985,7 +985,7 @@ void OFR_PostProcessor::init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t ch
         offset_L = 0;
     } else {
         mult_L = rc->read_uniform_split(bit_depth);
-        offset_L = rc->read_uniform_split(bit_depth);
+        offset_L = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
     }
 
     if (channels == 2) {
@@ -998,7 +998,7 @@ void OFR_PostProcessor::init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t ch
             offset_R = 0;
         } else {
             mult_R = rc->read_uniform_split(bit_depth);
-            offset_R = rc->read_uniform_split(bit_depth);
+            offset_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
         }
     }
 }

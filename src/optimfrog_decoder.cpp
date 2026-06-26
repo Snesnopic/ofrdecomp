@@ -196,18 +196,35 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                 }
             }
 
-            // data bit-length (local_4c in FUN_00010870) drives predictor shift and entropy depth
+            // data bit-length (local_4c in FUN_00010870) drives predictor shift and entropy depth.
+            // For post=1 with a non-identity mult/offset (the reference factors a common
+            // multiplier out of the signal), the predictor/entropy operate on the *reduced*
+            // coded range (value-offset)/mult, NOT the stored original min/max.
             int data_bits = 13;
             if (post_type != 0) {
                 OFR_PostProcessor* pp = this->block_decoder.post_processor;
+                int mnL = pp->min_val_L, mxL = pp->max_val_L;
+                int mnR = pp->min_val_R, mxR = pp->max_val_R;
+                if (post_type == 1) {
+                    mnL = (pp->min_val_L - pp->offset_L) / pp->mult_L;
+                    mxL = (pp->max_val_L - pp->offset_L) / pp->mult_L;
+                    if (mnL > mxL) std::swap(mnL, mxL);
+                    if (this->channels == 2) {
+                        mnR = (pp->min_val_R - pp->offset_R) / pp->mult_R;
+                        mxR = (pp->max_val_R - pp->offset_R) / pp->mult_R;
+                        if (mnR > mxR) std::swap(mnR, mxR);
+                    }
+                }
+                // write the reduced range back so the predictor clamps in coded space
+                pp->min_val_L = mnL; pp->max_val_L = mxL;
+                if (this->channels == 2) { pp->min_val_R = mnR; pp->max_val_R = mxR; }
                 if (this->channels == 2) {
-                    int mn = std::min(pp->min_val_L, pp->min_val_R);
-                    int mx = std::max(pp->max_val_L, pp->max_val_R);
-                    data_bits = ofr_bitlen(mn, mx);
+                    data_bits = ofr_bitlen(std::min(mnL, mnR), std::max(mxL, mxR));
                 } else {
-                    data_bits = ofr_bitlen(pp->min_val_L, pp->max_val_L);
+                    data_bits = ofr_bitlen(mnL, mxL);
                 }
             }
+
 
             // Predictor — dispatch on channels
             if (pred_type == 1) {

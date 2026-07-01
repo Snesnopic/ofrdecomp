@@ -33,7 +33,7 @@ cc_of() { [ "$1" = 2 ] && echo STEREO_LR || echo MONO; }
 # output and is never hidden by retry.
 rtry_out() { local out="$1"; shift; local i; for i in 1 2 3; do rm -f "$out"; "$@" >/dev/null 2>&1; [ -s "$out" ] && return 0; done; return 1; }
 
-refdec() { rtry_out "$2" env DYLD_LIBRARY_PATH="$DYLIBDIR" "$REFGEN" "$1" "$2"; }
+refdec() { rtry_out "$2" env DYLD_LIBRARY_PATH="$DYLIBDIR" LD_LIBRARY_PATH="$DYLIBDIR" "$REFGEN" "$1" "$2"; }
 ourdec() { rm -f "$WORK/tmp/test.raw"; local i; for i in 1 2 3; do ( cd "$WORK/tmp" && "$ODEC" "$1" >/dev/null 2>&1 ); [ -s "$WORK/tmp/test.raw" ] && { cp -f "$WORK/tmp/test.raw" "$2"; return 0; }; done; return 1; }
 
 # direction A: reference encode (per preset) -> ref + our decode -> must equal original

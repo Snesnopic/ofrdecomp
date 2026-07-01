@@ -1,13 +1,16 @@
 name: Conformance
 
-# Bidirectional proof against the reference codec (libOptimFROG.0.dylib, x86_64
-# Mach-O, committed at the repo root). Requires a native x86_64 macOS runner —
-# there is no Linux/Windows build of the reference library to compare against.
+# Bidirectional proof against the official reference codec.
 #
-# Only direction B (our encoder -> reference decoder) runs here: the official
-# `ofr` encoder binary is proprietary and not redistributed in this repo, so
-# direction A (reference encoder -> our decoder) is exercised locally by
-# maintainers (see tests/conformance/run.sh) but skipped in CI (SKIP_DIRA=1).
+# macOS job: uses libOptimFROG.0.dylib (x86_64 Mach-O, committed at the repo
+# root). Only direction B (our encoder -> reference decoder) runs here: the
+# official `ofr` encoder binary for macOS isn't in this repo, so direction A
+# is exercised locally by maintainers only (see tests/conformance/run.sh).
+#
+# Linux job: downloads the official Linux x64 build straight from
+# losslessaudio.org at run time (verified by its published sha1, never
+# committed to this repo -- nothing here is redistributed) and runs BOTH
+# directions natively, no wine/emulation needed.
 
 on:
   push:
@@ -17,8 +20,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  conformance:
-    name: Conformance (macOS x64)
+  conformance-macos:
+    name: Conformance (macOS x64, direction B)
     runs-on: macos-15-intel
 
     steps:
@@ -53,6 +56,62 @@ jobs:
           DYLIBDIR: ${{ github.workspace }}
           NFILES: 0
           SKIP_DIRA: 1
+          BPSLIST: "8 16 24 32"
+          SYNTH_PRESETS: "0 2 4 7 10 max"
+        run: bash tests/conformance/run.sh
+
+  conformance-linux:
+    name: Conformance (Linux x64, both directions)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch official OptimFROG Linux x64 build (ephemeral, sha1-verified, never redistributed)
+        run: |
+          curl -sL -o "$RUNNER_TEMP/ofr.zip" \
+              http://losslessaudio.org/Downloads/A1C0/5100/Linux/OptimFROG_Linux_x64_5100.zip
+          curl -sL -o "$RUNNER_TEMP/ofr.zip.sha1" \
+              http://losslessaudio.org/Downloads/A1C0/5100/Linux/OptimFROG_Linux_x64_5100.zip.sha1
+          expected=$(awk '{print $1}' "$RUNNER_TEMP/ofr.zip.sha1")
+          actual=$(sha1sum "$RUNNER_TEMP/ofr.zip" | awk '{print $1}')
+          [ "$expected" = "$actual" ] || { echo "sha1 mismatch: expected $expected got $actual"; exit 1; }
+          unzip -q "$RUNNER_TEMP/ofr.zip" -d "$RUNNER_TEMP/ofr_ref"
+          DIR="$RUNNER_TEMP/ofr_ref/OptimFROG_Linux_x64_5100"
+          chmod +x "$DIR/ofr"
+          echo "OFR_REF=$DIR/ofr" >> "$GITHUB_ENV"
+          echo "OFR_REF_LIBDIR=$DIR/SDK/Library" >> "$GITHUB_ENV"
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Decode sanity check (sine_mono / test_stereo, MD5 known-good)
+        run: |
+          check() {
+            ./build/optimfrogcpp "$1"
+            got=$(python3 -c "import hashlib;print(hashlib.md5(open('test.raw','rb').read()).hexdigest())")
+            [ "$got" = "$2" ] || { echo "MD5 mismatch for $1: got $got want $2"; exit 1; }
+          }
+          check sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
+          check test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
+
+      - name: Build reference decoder wrapper (against the official libOptimFROG.so.0)
+        run: |
+          gcc -I include tests/conformance/ref_gen.c \
+              "$OFR_REF_LIBDIR/libOptimFROG.so.0" -o "$RUNNER_TEMP/ref_gen" \
+              -Wl,-rpath,"$OFR_REF_LIBDIR"
+
+      - name: Run conformance suite (both directions, synthetic corpus only)
+        env:
+          OFR: ${{ env.OFR_REF }}
+          OFRENC: ${{ github.workspace }}/build/ofrenc
+          ODEC: ${{ github.workspace }}/build/optimfrogcpp
+          REFGEN: ${{ runner.temp }}/ref_gen
+          DYLIBDIR: ${{ env.OFR_REF_LIBDIR }}
+          NFILES: 0
           BPSLIST: "8 16 24 32"
           SYNTH_PRESETS: "0 2 4 7 10 max"
         run: bash tests/conformance/run.sh

@@ -388,7 +388,8 @@ struct OFR_PredictorStereo {
     ProgressCallback m_progress_cb;  // 0x65CB0
     bool m_is_fast;                  // 0x65CB8
     void init(OFR_RangeCoder* rc, uint32_t bit_depth);
-    void init_from_bitstream(OFR_RangeCoder* rc) {
+    void init_from_bitstream(OFR_RangeCoder*) {
+        // genuine no-op: all range-coder reads for the stereo predictor happen in init()
         m_need_init = true;
     }
     void decode(int32_t* outputs, uint32_t num_samples);
@@ -615,7 +616,7 @@ public:
 
 class OFR_DecoderEngine {
 public:
-    OFR_DecoderEngine() : bitstream(nullptr), headData(nullptr), decode_buffer(nullptr), tailData(nullptr), corr_stream(nullptr) {}
+    OFR_DecoderEngine() : bitstream(nullptr), headData(nullptr), tailData(nullptr), decode_buffer(nullptr), corr_stream(nullptr) {}
     virtual ~OFR_DecoderEngine();
     virtual bool open(ReadInterfaceWrapper* wrapper);
     virtual uInt32_t read(void* dest, uInt32_t count);

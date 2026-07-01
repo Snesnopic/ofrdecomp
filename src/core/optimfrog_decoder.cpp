@@ -84,9 +84,9 @@ bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
     this->speedup = val2 & 7;
     this->method = val2 >> 3;
     
-    int bytesRead = 0xf;
+    uint32_t bytesRead = 0xf;
     if (size >= 0x11) {
-        uint16_t extra_version = bs->readU16(); // not used according to decomp, just skipped
+        bs->readU16(); // extra_version, not used according to decomp, just skipped
         bytesRead = 0x11;
     }
     
@@ -160,11 +160,11 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             }
 
             uint32_t compressed_size = bs->readU32();
-            uint32_t skipped = bs->readU32();
+            bs->readU32();  // skipped field, unused
             uint32_t uncompressed_size = bs->readU32();
             
-            uint8_t uVar8 = bs->readU8();
-            uint8_t bVar2 = bs->readU8();
+            bs->readU8();  // uVar8, unused
+            bs->readU8();  // bVar2, unused
             uint16_t uVar15 = bs->readU16();
             
             
@@ -336,6 +336,6 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
 
     return read_so_far;
 }
-bool OFR_DecoderEngine::seek(sInt64_t sample_pos) { return false; }
+bool OFR_DecoderEngine::seek(sInt64_t) { return false; }
 bool OFR_DecoderEngine::readTail() { return false; }
 void OFR_DecoderEngine::close() {}

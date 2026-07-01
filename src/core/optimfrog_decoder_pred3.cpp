@@ -16,6 +16,10 @@
 // hardware yields INT32_MIN (0x80000000), not a modular wraparound (see the identical
 // helper + rationale in optimfrog_decoder_predictor.cpp). Only matters for 32-bit-range
 // content whose prediction can overshoot INT32_MAX.
+// Left-shifting a negative int is UB pre-C++20; see the identical helper + rationale in
+// optimfrog_decoder_predictor.cpp. Routes the shift-wrap trick through an unsigned shift.
+static inline int32_t shl_wrap(int32_t x, int sh) { return (int32_t)((uint32_t)x << sh); }
+
 static inline int32_t round_to_int32_cvtsd2si(double x) {
     long lr = std::lrint(x);
     return (lr < INT32_MIN || lr > INT32_MAX) ? INT32_MIN : (int32_t)lr;
@@ -81,14 +85,13 @@ static uint32_t sched_decode(SchedCtx& c, OFR_RangeCoder* rc) {
 }
 } // namespace
 
-static const double DAT_196e0 = -1.0;
 static const double DAT_19688 = 1000.0;
 static const double DAT_19718 = 1.0 / 1024.0;
 // cascade stage order table (DAT_21ea2)
 static const int cascade_order_tbl[] = {512,256,128,64,128,64,32,16,0,0,0,0,0,0,0,0,
                                         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
-void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, uint32_t bit_depth, int mn, int mx, int dbits, int total) {
+void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/, int mn, int mx, int dbits, int total) {
     min_val = mn; max_val = mx; shift = 32 - dbits; total_samples = total;
 
     // --- main LPC params (same as pred=1) ---
@@ -411,7 +414,7 @@ void OFR_PredictorCascadeMono::decode(int32_t* dest, uint32_t count) {
         if (cc_mode == 0) {
             int p = round_to_int32_cvtsd2si(main_lpc.predict());
             int cp = std::max(min_val, std::min(p, max_val));
-            out = ((cp + res) << sh) >> sh;
+            out = shl_wrap(cp + res, sh) >> sh;
             dest[i] = out;
             main_lpc.update((double)out);
             cascade_predict();
@@ -419,7 +422,7 @@ void OFR_PredictorCascadeMono::decode(int32_t* dest, uint32_t count) {
         } else {
             int p = cascade_predict();
             int cp = std::max(min_val, std::min(p, max_val));
-            out = ((cp + res) << sh) >> sh;
+            out = shl_wrap(cp + res, sh) >> sh;
             dest[i] = out;
             cascade_update((double)out);
             main_lpc.update((double)out);
@@ -571,7 +574,7 @@ void OFR_PredictorCascadeStereo::cascade_init() {
               (int)main_max_order, (int)main_max_order - (int)main_right_order, main_interval);
 }
 
-void OFR_PredictorCascadeStereo::init(OFR_RangeCoder* rc, uint32_t bit_depth,
+void OFR_PredictorCascadeStereo::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/,
         int Lmn,int Lmx,int Rmn,int Rmx, int dbits, int total) {
     min_L=Lmn; max_L=Lmx; min_R=Rmn; max_R=Rmx; shift=32-dbits; total_samples=total;
 
@@ -705,7 +708,7 @@ void OFR_PredictorCascadeStereo::decode(int32_t* dest, uint32_t count) {
         if (mode_L == 0) {
             int p = round_to_int32_cvtsd2si(main.predictLeft());
             int cp = std::max(min_L, std::min(p, max_L));
-            outL = ((cp + resL) << sh) >> sh;
+            outL = shl_wrap(cp + resL, sh) >> sh;
             dest[i] = outL;
             main.updateLeft((double)outL);
             sub_predict(casL, ringsA, ringsB);
@@ -713,7 +716,7 @@ void OFR_PredictorCascadeStereo::decode(int32_t* dest, uint32_t count) {
         } else {
             int p = sub_predict(casL, ringsA, ringsB);
             int cp = std::max(min_L, std::min(p, max_L));
-            outL = ((cp + resL) << sh) >> sh;
+            outL = shl_wrap(cp + resL, sh) >> sh;
             dest[i] = outL;
             sub_update(casL, ringsA, ringsB, (double)outL);
             main.updateLeft((double)outL);
@@ -723,7 +726,7 @@ void OFR_PredictorCascadeStereo::decode(int32_t* dest, uint32_t count) {
         if (mode_R == 0) {
             int p = round_to_int32_cvtsd2si(main.predictRight());
             int cp = std::max(min_R, std::min(p, max_R));
-            outR = ((cp + resR) << sh) >> sh;
+            outR = shl_wrap(cp + resR, sh) >> sh;
             dest[i+1] = outR;
             main.updateRight((double)outR);
             sub_predict(casR, ringsB, ringsA);
@@ -731,7 +734,7 @@ void OFR_PredictorCascadeStereo::decode(int32_t* dest, uint32_t count) {
         } else {
             int p = sub_predict(casR, ringsB, ringsA);
             int cp = std::max(min_R, std::min(p, max_R));
-            outR = ((cp + resR) << sh) >> sh;
+            outR = shl_wrap(cp + resR, sh) >> sh;
             dest[i+1] = outR;
             sub_update(casR, ringsB, ringsA, (double)outR);
             main.updateRight((double)outR);

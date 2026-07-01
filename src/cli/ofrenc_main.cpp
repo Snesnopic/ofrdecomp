@@ -63,7 +63,9 @@ int main(int argc, char** argv) {
     } else {
         enc_one(s, nvals, rate, ch, bps, out);
     }
-    FILE* g = fopen(argv[2], "wb"); fwrite(out.data(), 1, out.size(), g); fclose(g);
+    FILE* g = fopen(argv[2], "wb");
+    if (!g) { perror("out"); return 1; }
+    fwrite(out.data(), 1, out.size(), g); fclose(g);
     fprintf(stderr, "wrote %zu bytes (ch=%d bps=%d)\n", out.size(), ch, bps);
     return 0;
 }

@@ -125,7 +125,7 @@ static uint32_t init_tree_recursive(std::vector<uint32_t>& freqs, uint32_t node,
 }
 
 uint32_t decode_tree_symbol(
-    std::vector<uint32_t>& freqs, uint32_t num_nodes, uint32_t num_symbols,
+    std::vector<uint32_t>& freqs, uint32_t /*num_nodes*/, uint32_t num_symbols,
     uint32_t& total_freq, uint32_t limit, OFR_RangeCoder* rc, uint32_t increment)
 {
     rc->normalize();

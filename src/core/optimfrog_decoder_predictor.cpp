@@ -1,9 +1,14 @@
-#include <cstdio>
-#include <cstdlib>
 #include "optimfrog_tables.h"
 #include "../../include/optimfrog_decoder.h"
 
-OFR_Predictor::OFR_Predictor() : order(0), min_val(-0x800000), max_val(0x7fffff), shift(0), integrate(0) {
+// Left-shifting a negative int is UB pre-C++20 (well-defined two's-complement wraparound only
+// from C++20 on); this codebase's shift-wrap trick relies on exactly that wraparound (matching
+// the reference binary's native x86 SHL, which doesn't care about sign) to truncate a value to
+// data_bits precision, so route it through an unsigned shift -- identical bit pattern on every
+// real compiler/target, just standards-defined instead of formally UB.
+static inline int32_t shl_wrap(int32_t x, int sh) { return (int32_t)((uint32_t)x << sh); }
+
+OFR_Predictor::OFR_Predictor() : order(0), shift(0), min_val(-0x800000), max_val(0x7fffff), integrate(0) {
     history_head = history_buffer.data();
     for(int i=0; i<8; i++) last_int[i] = 0;
 }
@@ -29,7 +34,7 @@ void OFR_Predictor::init(int ord, int interval, double damp) {
     history_head = history_buffer.data() + hist_size - order;
 }
 
-void OFR_Predictor::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
+void OFR_Predictor::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/) {
     uint32_t uVar11 = rc->read_uniform_bits(12);
     int weight_param = 0;
     if (uVar11 == 0xfff) {
@@ -205,7 +210,7 @@ void OFR_Predictor::update(double sample) {
         
         update_cov_1();
         
-        if (update_interval <= sample_count - last_update_count) {
+        if ((uint32_t)update_interval <= sample_count - last_update_count) {
             if (vector_R[0] < 1e-10 && vector_R[0] != 0.0) {
                 for (int i = 0; i <= order; i++) vector_R[i] = 0.0;
             }
@@ -225,7 +230,7 @@ void OFR_Predictor::decode(int* dest, int count) {
         // fixes the int32 cast overflow, which only 32-bit-range content can hit.
         int p = (rounded < -2147483648.0 || rounded > 2147483647.0) ? INT32_MIN : (int)rounded;
         int cp = std::max(min_val, std::min(p, max_val));
-        int v = ((cp + error) << sh) >> sh;
+        int v = shl_wrap(cp + error, sh) >> sh;
         dest[i] = v;
         update((double)v);
     }
@@ -253,7 +258,7 @@ static uint32_t read_uniform_bits_16(OFR_RangeCoder* rc) {
     return (read_uniform_bits(rc, 8) << 8) | read_uniform_bits(rc, 8);
 }
 
-void OFR_PredictorFastStereo::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
+void OFR_PredictorFastStereo::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/) {
     uint32_t v1 = read_uniform_bits(rc, 12);
     if (v1 == 0xfff) v1 = read_uniform_bits_16(rc) + 0x1001;
     else v1 += 2;
@@ -283,26 +288,26 @@ void OFR_PredictorFastStereo::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
     
     uint32_t b = read_uniform_bits(rc, 1);
     if (b) {
-        uint32_t x = read_uniform_bits(rc, 10);
+        read_uniform_bits(rc, 10);  // consume, value unused on this path
     }
-    
+
     uint32_t cc_update = read_uniform_bits(rc, 12);
     if (cc_update == 0xfff) cc_update = read_uniform_bits_16(rc) + 0x1001;
     else cc_update += 2;
-    
-    uint32_t flag = read_uniform_bits(rc, 3);
+
+    read_uniform_bits(rc, 3);  // consume, value unused on this path
     uint32_t b2 = read_uniform_bits(rc, 1);
     if (b2) {
-        uint32_t f2 = read_uniform_bits_16(rc);
+        read_uniform_bits_16(rc);  // consume, value unused on this path
     }
-    
-    for (int i = 0; i < cc_count; i++) {
+
+    for (uint32_t i = 0; i < cc_count; i++) {
         uint32_t w = read_uniform_bits(rc, 5);
         if (w == 0x1f) {
-            uint32_t L = read_uniform_bits_8(rc);
-            uint32_t R = read_uniform_bits_8(rc);
+            read_uniform_bits_8(rc);  // consume, value unused on this path
+            read_uniform_bits_8(rc);
         }
-        uint32_t u = read_uniform_bits(rc, 10);
+        read_uniform_bits(rc, 10);  // consume, value unused on this path
     }
     
     int update_map[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144};
@@ -330,7 +335,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
             if (left_pred_int < min_val_L) left_pred_int = min_val_L;
             if (left_pred_int > max_val_L) left_pred_int = max_val_L;
             
-            left = (left_pred_int + (left << shift)) >> shift;
+            left = (left_pred_int + shl_wrap(left, shift)) >> shift;
             dest[i] = left;
             left_predictor.update(left);
             right_predictor.update(left);
@@ -342,7 +347,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
                 if (right_pred_int < min_val_R) right_pred_int = min_val_R;
                 if (right_pred_int > max_val_R) right_pred_int = max_val_R;
                 
-                right = (right_pred_int + (right << shift)) >> shift;
+                right = (right_pred_int + shl_wrap(right, shift)) >> shift;
                 dest[i + 1] = right;
                 right_predictor.update(right);
                 left_predictor.update(right);
@@ -353,7 +358,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
                 if (right_pred_int < min_val_R) right_pred_int = min_val_R;
                 if (right_pred_int > max_val_R) right_pred_int = max_val_R;
                 
-                right = (right_pred_int + (right << shift)) >> shift;
+                right = (right_pred_int + shl_wrap(right, shift)) >> shift;
                 dest[i + 1] = right;
                 left_predictor.update(right);
                 right_predictor.update(right);
@@ -365,7 +370,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
             if (left_pred_int < min_val_L) left_pred_int = min_val_L;
             if (left_pred_int > max_val_L) left_pred_int = max_val_L;
             
-            left = (left_pred_int + (left << shift)) >> shift;
+            left = (left_pred_int + shl_wrap(left, shift)) >> shift;
             dest[i] = left;
             right_predictor.update(left);
             left_predictor.update(left);
@@ -377,7 +382,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
                 if (right_pred_int < min_val_R) right_pred_int = min_val_R;
                 if (right_pred_int > max_val_R) right_pred_int = max_val_R;
                 
-                right = (right_pred_int + (right << shift)) >> shift;
+                right = (right_pred_int + shl_wrap(right, shift)) >> shift;
                 dest[i + 1] = right;
                 right_predictor.update(right);
                 left_predictor.update(right);
@@ -388,7 +393,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
                 if (right_pred_int < min_val_R) right_pred_int = min_val_R;
                 if (right_pred_int > max_val_R) right_pred_int = max_val_R;
                 
-                right = (right_pred_int + (right << shift)) >> shift;
+                right = (right_pred_int + shl_wrap(right, shift)) >> shift;
                 dest[i + 1] = right;
                 left_predictor.update(right);
                 right_predictor.update(right);
@@ -572,7 +577,7 @@ void OFR_PredictorStereo::decode(int32_t* outputs, uint32_t num_samples) {
         int32_t res = outputs[i];
         int32_t pr  = round_to_int32_cvtsd2si(m_inner.predictLeft());
         int32_t cl  = std::max(m_left_min, std::min(pr, m_left_max));
-        int32_t v   = ((cl + res) << shift) >> shift;
+        int32_t v   = shl_wrap(cl + res, shift) >> shift;
         outputs[i] = v;
         m_inner.updateLeft((double)v);
 
@@ -580,7 +585,7 @@ void OFR_PredictorStereo::decode(int32_t* outputs, uint32_t num_samples) {
         res = outputs[i + 1];
         pr  = round_to_int32_cvtsd2si(m_inner.predictRight());
         int32_t cr = std::max(m_right_min, std::min(pr, m_right_max));
-        v = ((cr + res) << shift) >> shift;
+        v = shl_wrap(cr + res, shift) >> shift;
         outputs[i + 1] = v;
         m_inner.updateRight((double)v);
     }

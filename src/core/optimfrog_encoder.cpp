@@ -19,6 +19,10 @@ static inline int32_t round_to_int32_cvtsd2si(double x) {
     return (lr < INT32_MIN || lr > INT32_MAX) ? INT32_MIN : (int32_t)lr;
 }
 
+// Left-shifting a negative int is UB pre-C++20; see the identical helper + rationale in
+// optimfrog_decoder_predictor.cpp. Routes the shift-wrap trick through an unsigned shift.
+static inline int32_t shl_wrap(int32_t x, int sh) { return (int32_t)((uint32_t)x << sh); }
+
 // FUN_00018d80 port (same as decoder's ofr_bitlen)
 static int ofr_bitlen(int mn, int mx) {
     uint32_t a = (uint32_t)((mn >> 31) ^ mn);
@@ -353,12 +357,12 @@ bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, in
             if (cm.cc_mode == 0) {
                 int p = round_to_int32_cvtsd2si(cm.main_lpc.predict());
                 int cp = std::max(mn, std::min(p, mx));
-                res[i] = ((out - cp) << sh) >> sh;
+                res[i] = shl_wrap(out - cp, sh) >> sh;
                 cm.main_lpc.update((double)out); cm.cascade_predict(); cm.cascade_update((double)out);
             } else {
                 int p = cm.cascade_predict();
                 int cp = std::max(mn, std::min(p, mx));
-                res[i] = ((out - cp) << sh) >> sh;
+                res[i] = shl_wrap(out - cp, sh) >> sh;
                 cm.cascade_update((double)out); cm.main_lpc.update((double)out);
             }
             if (--cm.cc_count == 0) { cm.cc_mode = cm.schedule[cm.sched_idx]; cm.cc_count = cm.seg_len; cm.sched_idx++; }
@@ -381,7 +385,7 @@ bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, in
             int p = (rounded < -2147483648.0 || rounded > 2147483647.0) ? INT32_MIN : (int)rounded;
             int cp = std::max(mn, std::min(p, mx));
             int v = samples[i];
-            int err = ((v - cp) << sh) >> sh;
+            int err = shl_wrap(v - cp, sh) >> sh;
             res[i] = err;
             pd.update((double)v);
         }
@@ -529,28 +533,28 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
             if (cs.mode_L == 0) {
                 int p = round_to_int32_cvtsd2si(cs.main.predictLeft());
                 int cp = std::max(mnL, std::min(p, mxL));
-                res[2*f] = ((L - cp) << sh) >> sh;
+                res[2*f] = shl_wrap(L - cp, sh) >> sh;
                 cs.main.updateLeft((double)L);
                 cs.sub_predict(cs.casL, cs.ringsA, cs.ringsB);
                 cs.sub_update(cs.casL, cs.ringsA, cs.ringsB, (double)L);
             } else {
                 int p = cs.sub_predict(cs.casL, cs.ringsA, cs.ringsB);
                 int cp = std::max(mnL, std::min(p, mxL));
-                res[2*f] = ((L - cp) << sh) >> sh;
+                res[2*f] = shl_wrap(L - cp, sh) >> sh;
                 cs.sub_update(cs.casL, cs.ringsA, cs.ringsB, (double)L);
                 cs.main.updateLeft((double)L);
             }
             if (cs.mode_R == 0) {
                 int p = round_to_int32_cvtsd2si(cs.main.predictRight());
                 int cp = std::max(mnR, std::min(p, mxR));
-                res[2*f+1] = ((R - cp) << sh) >> sh;
+                res[2*f+1] = shl_wrap(R - cp, sh) >> sh;
                 cs.main.updateRight((double)R);
                 cs.sub_predict(cs.casR, cs.ringsB, cs.ringsA);
                 cs.sub_update(cs.casR, cs.ringsB, cs.ringsA, (double)R);
             } else {
                 int p = cs.sub_predict(cs.casR, cs.ringsB, cs.ringsA);
                 int cp = std::max(mnR, std::min(p, mxR));
-                res[2*f+1] = ((R - cp) << sh) >> sh;
+                res[2*f+1] = shl_wrap(R - cp, sh) >> sh;
                 cs.sub_update(cs.casR, cs.ringsB, cs.ringsA, (double)R);
                 cs.main.updateRight((double)R);
             }
@@ -568,11 +572,11 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
             int L = samples[2*f], R = samples[2*f+1];
             int prL = round_to_int32_cvtsd2si(inner.predictLeft());
             int cl = std::max(mnL, std::min(prL, mxL));
-            res[2*f] = ((L - cl) << sh) >> sh;
+            res[2*f] = shl_wrap(L - cl, sh) >> sh;
             inner.updateLeft((double)L);
             int prR = round_to_int32_cvtsd2si(inner.predictRight());
             int cr = std::max(mnR, std::min(prR, mxR));
-            res[2*f+1] = ((R - cr) << sh) >> sh;
+            res[2*f+1] = shl_wrap(R - cr, sh) >> sh;
             inner.updateRight((double)R);
         }
     }

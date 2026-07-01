@@ -119,7 +119,7 @@ static condition_t file_eof(void* instance) {
     return feof(fw->file) ? C_TRUE : C_FALSE;
 }
 
-static condition_t file_seekable(void* instance) {
+static condition_t file_seekable(void*) {
     return C_TRUE;
 }
 

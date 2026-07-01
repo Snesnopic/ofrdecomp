@@ -320,12 +320,13 @@ decode_escape:
     }
 
 emit:
-    // Line 687: update variance in-place
-    uint32_t var_raw_val = (raw_val > 0x3fffffffu) ? 0x3fffffffu : raw_val;
-    var = var * weight + (double)var_raw_val * weight2;
-
-    if (raw_val > 1000) {
-    }
+    // Line 687: update variance in-place. Disassembly (0x5e1d-0x5e48) shows `movl %ebp,%eax`
+    // (zero-extends into RAX) followed by `cvtsi2sd %rax,%xmm1` -- a 64-BIT signed convert of
+    // a zero-extended 32-bit value, i.e. raw_val is always treated as non-negative, never as
+    // a signed int32 and never clamped. Our old `raw_val > 0x3fffffff ? 0x3fffffff : raw_val`
+    // clamp was a wrong invention: invisible at 16/24-bit (raw_val never approaches 0x3fffffff
+    // there) but wrong for full-range 32-bit content, where it under-counted the variance.
+    var = var * weight + (double)(uint64_t)raw_val * weight2;
 
     // Lines 686, 688-691: zigzag decode
     // uVar6 = raw_val >> 1;  if (raw_val & 1) uVar6 = ~uVar6;

@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "optimfrog_tables.h"
 #include "../include/optimfrog_decoder.h"
 
@@ -223,6 +225,17 @@ void OFR_Predictor::decode(int* dest, int count) {
         dest[i] = v;
         update((double)v);
     }
+}
+
+// Emulates the x86 cvtsd2si/cvttsd2si "integer indefinite" behavior: when the rounded
+// double doesn't fit in int32, hardware yields INT32_MIN (0x80000000), not a modular
+// wraparound. `(int32_t)lrint(x)` goes through a 64-bit long first, so out-of-range
+// values silently wrap instead of saturating to that sentinel -- invisible at 16/24-bit
+// (predictions never approach +-2^31 there) but wrong once a 32-bit-range predictor
+// overshoots INT32_MAX (e.g. extrapolating a ramp that's about to clamp/wrap).
+static inline int32_t round_to_int32_cvtsd2si(double x) {
+    long lr = std::lrint(x);
+    return (lr < INT32_MIN || lr > INT32_MAX) ? INT32_MIN : (int32_t)lr;
 }
 
 static uint32_t read_uniform_bits(OFR_RangeCoder* rc, uint32_t bits) {
@@ -553,7 +566,7 @@ void OFR_PredictorStereo::decode(int32_t* outputs, uint32_t num_samples) {
 
         // left
         int32_t res = outputs[i];
-        int32_t pr  = (int32_t)std::lrint(m_inner.predictLeft());
+        int32_t pr  = round_to_int32_cvtsd2si(m_inner.predictLeft());
         int32_t cl  = std::max(m_left_min, std::min(pr, m_left_max));
         int32_t v   = ((cl + res) << shift) >> shift;
         outputs[i] = v;
@@ -561,7 +574,7 @@ void OFR_PredictorStereo::decode(int32_t* outputs, uint32_t num_samples) {
 
         // right
         res = outputs[i + 1];
-        pr  = (int32_t)std::lrint(m_inner.predictRight());
+        pr  = round_to_int32_cvtsd2si(m_inner.predictRight());
         int32_t cr = std::max(m_right_min, std::min(pr, m_right_max));
         v = ((cr + res) << shift) >> shift;
         outputs[i + 1] = v;

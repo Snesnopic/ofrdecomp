@@ -9,6 +9,16 @@
 #include <vector>
 #include <algorithm>
 
+// Emulates the x86 cvtsd2si "integer indefinite" behavior (see the matching decoder-side
+// helper in optimfrog_decoder_predictor.cpp for the full rationale): when a prediction
+// overflows int32 range, hardware yields INT32_MIN, not a modular wraparound. The encoder
+// must reproduce this exactly since it computes residual = sample - clamp(round(predict())),
+// and the decoder's clamp has to land on the same value to reconstruct losslessly.
+static inline int32_t round_to_int32_cvtsd2si(double x) {
+    long lr = std::lrint(x);
+    return (lr < INT32_MIN || lr > INT32_MAX) ? INT32_MIN : (int32_t)lr;
+}
+
 // FUN_00018d80 port (same as decoder's ofr_bitlen)
 static int ofr_bitlen(int mn, int mx) {
     uint32_t a = (uint32_t)((mn >> 31) ^ mn);
@@ -341,7 +351,7 @@ bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, in
             if (--cm.sample_counter == 0) cm.sample_counter = 0xac44;
             int out = samples[i];
             if (cm.cc_mode == 0) {
-                int p = (int)std::lrint(cm.main_lpc.predict());
+                int p = round_to_int32_cvtsd2si(cm.main_lpc.predict());
                 int cp = std::max(mn, std::min(p, mx));
                 res[i] = ((out - cp) << sh) >> sh;
                 cm.main_lpc.update((double)out); cm.cascade_predict(); cm.cascade_update((double)out);
@@ -516,7 +526,7 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
             if (--cs.sample_counter == 0) cs.sample_counter = 0xac44;
             int L = samples[2*f], R = samples[2*f+1];
             if (cs.mode_L == 0) {
-                int p = (int)std::lrint(cs.main.predictLeft());
+                int p = round_to_int32_cvtsd2si(cs.main.predictLeft());
                 int cp = std::max(mnL, std::min(p, mxL));
                 res[2*f] = ((L - cp) << sh) >> sh;
                 cs.main.updateLeft((double)L);
@@ -530,7 +540,7 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
                 cs.main.updateLeft((double)L);
             }
             if (cs.mode_R == 0) {
-                int p = (int)std::lrint(cs.main.predictRight());
+                int p = round_to_int32_cvtsd2si(cs.main.predictRight());
                 int cp = std::max(mnR, std::min(p, mxR));
                 res[2*f+1] = ((R - cp) << sh) >> sh;
                 cs.main.updateRight((double)R);
@@ -555,11 +565,11 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
         inner.init((double)(WPRED - 1) / (double)WPRED, max_order, max_order - right_order, (uint32_t)interval);
         for (uint32_t f = 0; f < frames; f++) {
             int L = samples[2*f], R = samples[2*f+1];
-            int prL = (int)std::lrint(inner.predictLeft());
+            int prL = round_to_int32_cvtsd2si(inner.predictLeft());
             int cl = std::max(mnL, std::min(prL, mxL));
             res[2*f] = ((L - cl) << sh) >> sh;
             inner.updateLeft((double)L);
-            int prR = (int)std::lrint(inner.predictRight());
+            int prR = round_to_int32_cvtsd2si(inner.predictRight());
             int cr = std::max(mnR, std::min(prR, mxR));
             res[2*f+1] = ((R - cr) << sh) >> sh;
             inner.updateRight((double)R);

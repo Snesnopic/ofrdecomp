@@ -415,21 +415,21 @@ void OFR_PostProcessor::decode(int* dest, int count, int channels) {
     for (int i = 0; i < count * channels; i += channels) {
         if (m_channels == 1) {
             int32_t left = dest[i];
-            int64_t left_scaled = (int64_t)left * mult_L + offset_L;
-            // if (left_scaled < min_val_L) left_scaled = min_val_L;
-            // else if (left_scaled > max_val_L) left_scaled = max_val_L;
+            int64_t left_scaled = (int64_t)(uint32_t)mult_L * (int64_t)left + offset_L;
+            if (left_scaled <= min_val_L) left_scaled = min_val_L;
+            else if (left_scaled > max_val_L) left_scaled = max_val_L;
             dest[i] = (int32_t)left_scaled;
         } else {
             int right = dest[i + 1];
-            
-            int64_t left_scaled = (int64_t)dest[i] * mult_L + offset_L;
-            // if (left_scaled < min_val_L) left_scaled = min_val_L;
-            // if (left_scaled > max_val_L) left_scaled = max_val_L;
+
+            int64_t left_scaled = (int64_t)(uint32_t)mult_L * (int64_t)dest[i] + offset_L;
+            if (left_scaled <= min_val_L) left_scaled = min_val_L;
+            else if (left_scaled > max_val_L) left_scaled = max_val_L;
             dest[i] = (int)left_scaled;
-            
-            int64_t right_scaled = (int64_t)right * mult_R + offset_R;
-            // if (right_scaled < min_val_R) right_scaled = min_val_R;
-            // if (right_scaled > max_val_R) right_scaled = max_val_R;
+
+            int64_t right_scaled = (int64_t)(uint32_t)mult_R * (int64_t)right + offset_R;
+            if (right_scaled <= min_val_R) right_scaled = min_val_R;
+            else if (right_scaled > max_val_R) right_scaled = max_val_R;
             dest[i + 1] = (int)right_scaled;
         }
     }

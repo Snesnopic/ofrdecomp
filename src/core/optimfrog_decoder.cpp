@@ -1,5 +1,4 @@
 #include "../../include/optimfrog_decoder.h"
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
@@ -243,9 +242,14 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                         ofr_reduce_range(pp->min_val_R, pp->max_val_R, pp->offset_R, pp->mult_R, mnR, mxR);
                     }
                 }
-                // write the reduced range back so the predictor clamps in coded space
-                pp->min_val_L = mnL; pp->max_val_L = mxL;
-                if (this->channels == 2) { pp->min_val_R = mnR; pp->max_val_R = mxR; }
+                // Predictor/entropy clamp in the *reduced* coded space; keep min_val_L/max_val_L
+                // (and R) untouched at their original values, since OFR_PostProcessor::decode's
+                // final reconstruction (post_type==1) clamps the value*mult+offset result to the
+                // ORIGINAL range in 64-bit, before truncating to int32 -- essential whenever mult
+                // doesn't exactly divide every sample's distance from offset (e.g. a smooth/tonal
+                // signal that only approximately factors through a common multiplier).
+                pp->scaled_min_L = mnL; pp->scaled_max_L = mxL;
+                if (this->channels == 2) { pp->scaled_min_R = mnR; pp->scaled_max_R = mxR; }
                 if (this->channels == 2) {
                     data_bits = ofr_bitlen(std::min(mnL, mnR), std::max(mxL, mxR));
                 } else {
@@ -265,8 +269,8 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                     // FUN_00006f50: min/max/shift from post-processor
                     if (post_type != 0) {
                         OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                        pd->min_val = pp->min_val_L;
-                        pd->max_val = pp->max_val_L;
+                        pd->min_val = pp->scaled_min_L;
+                        pd->max_val = pp->scaled_max_L;
                     }
                     pd->shift = 32 - data_bits;
                 } else {
@@ -278,10 +282,10 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                     ps->init_from_bitstream(&this->range_coder);
                     // FUN_00007400: copy postproc min/max and shift into predictor
                     OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                    ps->m_left_min  = pp->min_val_L;
-                    ps->m_left_max  = pp->max_val_L;
-                    ps->m_right_min = pp->min_val_R;
-                    ps->m_right_max = pp->max_val_R;
+                    ps->m_left_min  = pp->scaled_min_L;
+                    ps->m_left_max  = pp->scaled_max_L;
+                    ps->m_right_min = pp->scaled_min_R;
+                    ps->m_right_max = pp->scaled_max_R;
                     ps->m_shift = 32u - (uint32_t)data_bits;
                 }
             } else if (pred_type == 3 && this->channels == 1) {
@@ -289,8 +293,8 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                     this->block_decoder.predictor_cascade_mono = new OFR_PredictorCascadeMono();
                 }
                 OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                int mn = pp ? pp->min_val_L : -0x800000;
-                int mx = pp ? pp->max_val_L : 0x7fffff;
+                int mn = pp ? pp->scaled_min_L : -0x800000;
+                int mx = pp ? pp->scaled_max_L : 0x7fffff;
                 this->block_decoder.predictor_cascade_mono->init(
                     &this->range_coder, this->bitspersample, mn, mx, data_bits, (int)uncompressed_size);
             } else if (pred_type == 3 && this->channels == 2) {
@@ -300,7 +304,7 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                 OFR_PostProcessor* pp = this->block_decoder.post_processor;
                 this->block_decoder.predictor_cascade_stereo->init(
                     &this->range_coder, this->bitspersample,
-                    pp->min_val_L, pp->max_val_L, pp->min_val_R, pp->max_val_R,
+                    pp->scaled_min_L, pp->scaled_max_L, pp->scaled_min_R, pp->scaled_max_R,
                     data_bits, (int)uncompressed_size);
             }
 

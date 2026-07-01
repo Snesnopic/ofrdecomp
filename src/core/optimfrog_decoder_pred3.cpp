@@ -138,7 +138,7 @@ void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/, 
 
     // per-stage order + mu
     stages.assign(n_stages + 1, OFR_CascadeStage());
-    double stage_eps = std::max({(double)std::abs(min_val), (double)std::abs(max_val), 1.0});
+    double stage_eps = std::max({(double)std::abs((int64_t)min_val), (double)std::abs((int64_t)max_val), 1.0});
     for (int s = 1; s <= n_stages; ++s) {
         uint32_t o5 = rc->read_uniform_bits(5);
         int order = (o5 == 0x1f) ? ((int)rc->read_uniform_bits(8) * 4 + 4) : cascade_order_tbl[o5];
@@ -209,7 +209,7 @@ void OFR_PredictorCascadeMono::setup_for_encode(int mn, int mx, int dbits, int t
     uint32_t fc_weight_param = fc_w;
 
     stages.assign(n_stages + 1, OFR_CascadeStage());
-    double stage_eps = std::max({(double)std::abs(min_val), (double)std::abs(max_val), 1.0});
+    double stage_eps = std::max({(double)std::abs((int64_t)min_val), (double)std::abs((int64_t)max_val), 1.0});
     for (int s = 1; s <= n_stages; ++s) {
         int order = stage_orders[s - 1];
         double mu = (double)stage_mu10[s - 1] / DAT_19688;
@@ -606,8 +606,8 @@ void OFR_PredictorCascadeStereo::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/
     ringsA.assign(n_stages + 1, OFR_CascadeRing());
     ringsB.assign(n_stages + 1, OFR_CascadeRing());
 
-    double eps = std::max({(double)std::abs(min_L),(double)std::abs(max_L),
-                           (double)std::abs(min_R),(double)std::abs(max_R), 1.0});
+    double eps = std::max({(double)std::abs((int64_t)min_L),(double)std::abs((int64_t)max_L),
+                           (double)std::abs((int64_t)min_R),(double)std::abs((int64_t)max_R), 1.0});
     for (int s = 1; s <= n_stages; ++s) {
         uint32_t o5 = rc->read_uniform_bits(5);
         int size1, size2;
@@ -671,8 +671,8 @@ void OFR_PredictorCascadeStereo::setup_for_encode(int Lmn,int Lmx,int Rmn,int Rm
     ringsA.assign(n_stages + 1, OFR_CascadeRing());
     ringsB.assign(n_stages + 1, OFR_CascadeRing());
 
-    double eps = std::max({(double)std::abs(min_L),(double)std::abs(max_L),
-                           (double)std::abs(min_R),(double)std::abs(max_R), 1.0});
+    double eps = std::max({(double)std::abs((int64_t)min_L),(double)std::abs((int64_t)max_L),
+                           (double)std::abs((int64_t)min_R),(double)std::abs((int64_t)max_R), 1.0});
     for (int s = 1; s <= n_stages; ++s) {
         int size1 = stage_size1[s-1], size2 = stage_size2[s-1];
         double mu = (double)stage_mu10[s-1] / DAT_19688;

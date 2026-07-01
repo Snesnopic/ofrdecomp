@@ -3,7 +3,11 @@ project(optimfrogcpp CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD 99)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math")
+if(MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /fp:fast")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math")
+endif()
 
 include_directories(include)
 
@@ -18,10 +22,15 @@ add_library(optimfrogcpp_lib
     src/core/optimfrog_encoder.cpp
 )
 
-# float math that must NOT be reordered/contracted by -ffast-math (bit-exactness vs the binary,
+# float math that must NOT be reordered/contracted (bit-exactness vs the reference binary,
 # which was built -fno-fast-math). pred3 cascade + the mono predictor weight-update/LDLT.
-set_source_files_properties(src/core/optimfrog_decoder_pred3.cpp src/core/optimfrog_decoder_predictor.cpp PROPERTIES
-    COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+if(MSVC)
+    set_source_files_properties(src/core/optimfrog_decoder_pred3.cpp src/core/optimfrog_decoder_predictor.cpp PROPERTIES
+        COMPILE_OPTIONS "/fp:precise")
+else()
+    set_source_files_properties(src/core/optimfrog_decoder_pred3.cpp src/core/optimfrog_decoder_predictor.cpp PROPERTIES
+        COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+endif()
 
 add_executable(optimfrogcpp src/cli/main.cpp)
 target_link_libraries(optimfrogcpp optimfrogcpp_lib)

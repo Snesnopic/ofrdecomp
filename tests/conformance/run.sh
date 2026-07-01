@@ -71,7 +71,7 @@ dirB() {
 }
 
 run_raw() { # path ch bps rate tag plist bmodes
-  dirA "$1" "$2" "$3" "$4" "$5" "$6"
+  [ "$SKIP_DIRA" = 1 ] || dirA "$1" "$2" "$3" "$4" "$5" "$6"
   dirB "$1" "$2" "$3" "$4" "$5" "$7"
 }
 
@@ -99,6 +99,7 @@ SYNTH_PRESETS="${SYNTH_PRESETS:-$PRESETS}"
 CORPUS_PRESETS="${CORPUS_PRESETS:-$PRESETS}"
 HEAVYPRESETS="${HEAVYPRESETS:-10 max}"
 HEAVYN="${HEAVYN:-9999}"
+SKIP_DIRA="${SKIP_DIRA:-0}"    # set to 1 when the reference `ofr` encoder binary isn't available (e.g. CI)
 SYNTH_BMODES="${SYNTH_BMODES:-default best ent2 pred3}"
 CORPUS_BMODES="${CORPUS_BMODES:-default best ent2 pred3}"
 CORPUS_BMODES_LIGHT="${CORPUS_BMODES_LIGHT:-default ent2 pred3}"

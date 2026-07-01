@@ -1,0 +1,67 @@
+name: Build
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu x64 GCC
+            os: ubuntu-latest
+            asset_name: optimfrogcpp-linux-x64
+
+          - name: macOS Intel
+            os: macos-13
+            asset_name: optimfrogcpp-darwin-x64
+
+          - name: macOS ARM64
+            os: macos-14
+            asset_name: optimfrogcpp-darwin-arm64
+
+          - name: Windows x64
+            os: windows-latest
+            asset_name: optimfrogcpp-windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Decode sanity check (sine_mono / test_stereo, MD5 known-good)
+        shell: bash
+        run: |
+          bin=build/optimfrogcpp
+          [ -f "build/Release/optimfrogcpp.exe" ] && bin=build/Release/optimfrogcpp.exe
+          [ -f "build/optimfrogcpp.exe" ] && bin=build/optimfrogcpp.exe
+          check() { # ofr_file expected_md5
+            "$bin" "$1"
+            got=$(python3 -c "import hashlib;print(hashlib.md5(open('test.raw','rb').read()).hexdigest())")
+            [ "$got" = "$2" ] || { echo "MD5 mismatch for $1: got $got want $2"; exit 1; }
+          }
+          check sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
+          check test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            build/optimfrogcpp
+            build/ofrenc
+            build/ofr
+            build/Release/optimfrogcpp.exe
+            build/Release/ofrenc.exe
+            build/Release/ofr.exe

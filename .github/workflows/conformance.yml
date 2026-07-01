@@ -1,0 +1,58 @@
+name: Conformance
+
+# Bidirectional proof against the reference codec (libOptimFROG.0.dylib, x86_64
+# Mach-O, committed at the repo root). Requires a native x86_64 macOS runner —
+# there is no Linux/Windows build of the reference library to compare against.
+#
+# Only direction B (our encoder -> reference decoder) runs here: the official
+# `ofr` encoder binary is proprietary and not redistributed in this repo, so
+# direction A (reference encoder -> our decoder) is exercised locally by
+# maintainers (see tests/conformance/run.sh) but skipped in CI (SKIP_DIRA=1).
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  conformance:
+    name: Conformance (macOS x64)
+    runs-on: macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Decode sanity check (sine_mono / test_stereo, MD5 known-good)
+        run: |
+          check() {
+            ./build/optimfrogcpp "$1"
+            got=$(python3 -c "import hashlib;print(hashlib.md5(open('test.raw','rb').read()).hexdigest())")
+            [ "$got" = "$2" ] || { echo "MD5 mismatch for $1: got $got want $2"; exit 1; }
+          }
+          check sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
+          check test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
+
+      - name: Build reference decoder wrapper
+        run: |
+          clang -arch x86_64 -I include tests/conformance/ref_gen.c \
+              libOptimFROG.0.dylib -o /tmp/ref_gen
+
+      - name: Run conformance suite (direction B, synthetic corpus only)
+        env:
+          OFRENC: ${{ github.workspace }}/build/ofrenc
+          ODEC: ${{ github.workspace }}/build/optimfrogcpp
+          REFGEN: /tmp/ref_gen
+          DYLIBDIR: ${{ github.workspace }}
+          NFILES: 0
+          SKIP_DIRA: 1
+          BPSLIST: "8 16 24 32"
+          SYNTH_PRESETS: "0 2 4 7 10 max"
+        run: bash tests/conformance/run.sh

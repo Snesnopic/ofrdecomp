@@ -878,7 +878,11 @@ void OFR_PredictorStereo_Inner::updateLeft(double sample) {
         }
         updateAutocorrLeft();
         if (m_update_interval <= m_count_left - m_update_count_left) {
-            if (!(m_R_left[0] < 1e15 && m_R_left[0] != -1e15) && m_max_order > -1) {
+            // DAT_19778 = 2^-30: snap a near-zero (numerical-noise) R[0] to exactly zero.
+            // NOT a large-magnitude overflow guard -- that reading (an arbitrary 1e15 sentinel)
+            // was wrong and, since real 16-bit R[0] never gets near it, was a silent no-op there;
+            // at 24/32-bit R[0] legitimately exceeds 1e15, spuriously wiping valid correlation data.
+            if (m_R_left[0] < 9.31322574615478515625e-10 && m_R_left[0] != 0.0) {
                 std::memset(m_R_left, 0, (m_max_order * 2 + 1) * sizeof(double));
             }
             if (!m_is_cholesky_fail_left) {
@@ -929,7 +933,8 @@ void OFR_PredictorStereo_Inner::updateRight(double sample) {
         }
         updateAutocorrRight();
         if (m_update_interval <= m_count_right - m_update_count_right) {
-            if (!(m_R_right[0] < 1e15 && m_R_right[0] != -1e15) && m_max_order > -1) {
+            // DAT_19778 = 2^-30, same near-zero R clamp as updateLeft (see comment there).
+            if (m_R_right[0] < 9.31322574615478515625e-10 && m_R_right[0] != 0.0) {
                 std::memset(m_R_right, 0, (m_max_order * 2 + 1) * sizeof(double));
             }
             if (!m_is_cholesky_fail_right) {

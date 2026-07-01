@@ -17,7 +17,17 @@ jobs:
         include:
           - name: Ubuntu x64 GCC
             os: ubuntu-latest
-            asset_name: optimfrogcpp-linux-x64
+            asset_name: optimfrogcpp-linux-x64-gcc
+
+          - name: Ubuntu x64 Clang
+            os: ubuntu-latest
+            compiler_c: clang
+            compiler_cxx: clang++
+            asset_name: optimfrogcpp-linux-x64-clang
+
+          - name: Ubuntu ARM64 GCC
+            os: ubuntu-24.04-arm
+            asset_name: optimfrogcpp-linux-arm64
 
           - name: macOS Intel
             os: macos-15-intel
@@ -31,16 +41,26 @@ jobs:
             os: windows-latest
             asset_name: optimfrogcpp-windows-x64
 
+          - name: Windows ARM64
+            os: windows-latest
+            cmake_args: -A ARM64
+            asset_name: optimfrogcpp-windows-arm64
+            skip_sanity_check: true   # cross-compiled; host runner can't execute ARM64 binaries
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+        env:
+          CC: ${{ matrix.compiler_c }}
+          CXX: ${{ matrix.compiler_cxx }}
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
       - name: Decode sanity check (sine_mono / test_stereo, MD5 known-good)
+        if: '!matrix.skip_sanity_check'
         shell: bash
         run: |
           bin=build/optimfrogcpp
@@ -55,7 +75,7 @@ jobs:
           check test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: |

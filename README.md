@@ -30,11 +30,19 @@ cmake -B build
 cmake --build build
 ```
 
-Produces two binaries in `build/`:
+Produces three binaries in `build/`:
 
-- `optimfrogcpp` — decoder CLI (currently minimal; see [doc/status.md](doc/status.md) for the
-  planned parity with the original `ofr` CLI's `--encode/--decode/--info/--preset/...` interface).
-- `ofrenc` — encoder CLI: `ofrenc in.raw out.ofr samplerate [channels=1] [bps=16]`.
+- `ofr` — unified CLI aiming for usage parity with the original tool:
+  ```sh
+  ofr --encode [options] src [--output dst] ...
+  ofr --decode [options] src [--output dst] ...
+  ofr --info src ...
+  ```
+  Supports `--preset {0-10,max}`, `--raw` + `--channelconfig`/`--sampletype`/`--rate` (headerless
+  PCM), WAV in/out by default, `--output`, `--overwrite`, `--silent`, `--help`. Skips the original's
+  rarely-used flags (`--selfextract`, `--deleteafter`, `--timestamp`, `--incorrectheader`, ...).
+- `optimfrogcpp` / `ofrenc` — the original minimal single-purpose CLIs (decode-only /
+  positional-args encode), kept for backward compatibility with existing scripts.
 
 ## Repository layout
 

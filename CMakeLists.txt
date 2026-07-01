@@ -26,6 +26,10 @@ set_source_files_properties(src/core/optimfrog_decoder_pred3.cpp src/core/optimf
 add_executable(optimfrogcpp src/cli/main.cpp)
 target_link_libraries(optimfrogcpp optimfrogcpp_lib)
 
-# encoder CLI (mono 16-bit lossless, pred=1/ent=1/post=1)
+# encoder CLI (positional args: in.raw out.ofr rate [channels] [bps])
 add_executable(ofrenc src/cli/ofrenc_main.cpp)
 target_link_libraries(ofrenc optimfrogcpp_lib)
+
+# unified CLI aiming for usage/flag parity with the original `ofr` tool
+add_executable(ofr src/cli/ofr_main.cpp)
+target_link_libraries(ofr optimfrogcpp_lib)

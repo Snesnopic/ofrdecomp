@@ -173,10 +173,19 @@ uint32_t OFR_EntropyAcm::decode_sample(Chan& c, OFR_RangeCoder* rc) {
         // escape
         uint32_t v = sym2 * pred;
         uint32_t bits = int_bitlen(v);
-        uint32_t rem = bit_depth - bits;
-        uint32_t idx = uni(rc, rem);
-        uint32_t low = rc->read_uniform_bits(idx + bits);
-        value = (1u << (idx + bits)) + low;
+        // guard mirrors the ent=2 escape check: bits must stay below bit_depth or
+        // `bit_depth - bits` underflows (uint32_t) and the range coder locks up.
+        // Real audio never hits this (bit_depth is always comfortably larger than
+        // the escape bit count); only pathological near-constant tiny-amplitude
+        // synthetic signals with a very small derived bit_depth can.
+        if (bits >= bit_depth) {
+            value = 0;
+        } else {
+            uint32_t rem = bit_depth - bits;
+            uint32_t idx = uni(rc, rem);
+            uint32_t low = rc->read_uniform_bits(idx + bits);
+            value = (1u << (idx + bits)) + low;
+        }
     } else {
         uint32_t residual;
         if (pred < 0x4001u) {

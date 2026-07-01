@@ -73,6 +73,13 @@
 #define CFG_LITTLE_ENDIAN
 #define CFG_ATTRIBUTE_PACKED
 
+#elif defined(__GNUC__) && defined(__linux__) && defined(__aarch64__)
+
+#define CFG_BUILD_NAME "GNUC_LINUX_ARM64"
+#define CFG_GNUC_LINUX_ARM64
+#define CFG_LITTLE_ENDIAN
+#define CFG_ATTRIBUTE_PACKED
+
 #elif defined(__GNUC__) && defined(__MACH__) && (defined(__x86_64__) || defined(__aarch64__))
 
 #define CFG_BUILD_NAME "GNUC_MACH_X8664_OR_ARM64"

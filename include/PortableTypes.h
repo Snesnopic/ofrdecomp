@@ -30,7 +30,7 @@ typedef unsigned char condition_t;
 typedef float Float32_t;
 typedef double Float64_t;
 
-#elif defined(CFG_GNUC_MINGW32_I386) || defined(CFG_GNUC_CYGWIN_I386) || defined(CFG_GNUC_DJGPP_I386) || defined(CFG_GNUC_LINUX_I386) || defined(CFG_GNUC_MACH_PPC) || defined(CFG_GNUC_MACH_I386) || defined(CFG_GNUC_LINUX_X8664) || defined(CFG_GNUC_MACH_X8664) || defined(CFG_GNUC_FREEBSD_I386) || defined(CFG_GNUC_FREEBSD_X8664)
+#elif defined(CFG_GNUC_MINGW32_I386) || defined(CFG_GNUC_CYGWIN_I386) || defined(CFG_GNUC_DJGPP_I386) || defined(CFG_GNUC_LINUX_I386) || defined(CFG_GNUC_MACH_PPC) || defined(CFG_GNUC_MACH_I386) || defined(CFG_GNUC_LINUX_X8664) || defined(CFG_GNUC_LINUX_ARM64) || defined(CFG_GNUC_MACH_X8664) || defined(CFG_GNUC_FREEBSD_I386) || defined(CFG_GNUC_FREEBSD_X8664)
 
 typedef signed char sInt8_t;
 typedef unsigned char uInt8_t;

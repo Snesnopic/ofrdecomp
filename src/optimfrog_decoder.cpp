@@ -206,12 +206,15 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                 int mnL = pp->min_val_L, mxL = pp->max_val_L;
                 int mnR = pp->min_val_R, mxR = pp->max_val_R;
                 if (post_type == 1) {
-                    mnL = (pp->min_val_L - pp->offset_L) / pp->mult_L;
-                    mxL = (pp->max_val_L - pp->offset_L) / pp->mult_L;
+                    // mult_L/R is an unsigned scale (may be exactly 2^31); do the division in
+                    // int64_t so a negative numerator stays signed instead of converting to
+                    // unsigned via the usual arithmetic conversions.
+                    mnL = (int32_t)((int64_t)(pp->min_val_L - pp->offset_L) / (int64_t)pp->mult_L);
+                    mxL = (int32_t)((int64_t)(pp->max_val_L - pp->offset_L) / (int64_t)pp->mult_L);
                     if (mnL > mxL) std::swap(mnL, mxL);
                     if (this->channels == 2) {
-                        mnR = (pp->min_val_R - pp->offset_R) / pp->mult_R;
-                        mxR = (pp->max_val_R - pp->offset_R) / pp->mult_R;
+                        mnR = (int32_t)((int64_t)(pp->min_val_R - pp->offset_R) / (int64_t)pp->mult_R);
+                        mxR = (int32_t)((int64_t)(pp->max_val_R - pp->offset_R) / (int64_t)pp->mult_R);
                         if (mnR > mxR) std::swap(mnR, mxR);
                     }
                 }

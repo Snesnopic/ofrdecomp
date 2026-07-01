@@ -555,13 +555,12 @@ public:
 
     int min_val_L;
     int max_val_L;
-    uint32_t mult_L;   // semantically an always-positive scale factor; a signed `int` would
-                        // reinterpret bit-pattern 0x80000000 (2^31) as -2147483648
+    int mult_L;
     int offset_L;
 
     int min_val_R;
     int max_val_R;
-    uint32_t mult_R;
+    int mult_R;
     int offset_R;
 
     int scaled_min_L;

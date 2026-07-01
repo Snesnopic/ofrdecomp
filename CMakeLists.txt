@@ -11,6 +11,10 @@ endif()
 
 include_directories(include)
 
+# we always statically link our own implementation of the OptimFROG.h API (never a
+# prebuilt OptimFROG.dll), so the SDK header's dllimport decoration is wrong here.
+add_compile_definitions(IMPORT_SYMBOL=)
+
 add_library(optimfrogcpp_lib
     src/core/optimfrog.cpp
     src/core/optimfrog_decoder.cpp

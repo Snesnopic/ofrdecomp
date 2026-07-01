@@ -20,6 +20,15 @@
 
 namespace {
 
+// setenv is POSIX-only; MSVC has no equivalent besides _putenv_s.
+static inline void ofr_setenv(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 // ---------------- minimal canonical PCM WAV read/write ----------------
 
 struct WavInfo { uint32_t rate = 0; uint16_t channels = 0; uint16_t bits = 0; };
@@ -191,10 +200,10 @@ int do_encode(const std::vector<SrcDst>& files, const std::string& preset, bool 
             samples[i] = v;
         }
         PresetConfig cfg = preset_config(preset, channels);
-        setenv("OFR_PRED", std::to_string(cfg.pred).c_str(), 1);
-        setenv("OFR_ENT", std::to_string(cfg.ent).c_str(), 1);
-        setenv("OFR_ORDER", std::to_string(cfg.mono_order).c_str(), 1);
-        setenv("OFR_ODIDX", std::to_string(cfg.od_idx).c_str(), 1);
+        ofr_setenv("OFR_PRED", std::to_string(cfg.pred).c_str());
+        ofr_setenv("OFR_ENT", std::to_string(cfg.ent).c_str());
+        ofr_setenv("OFR_ORDER", std::to_string(cfg.mono_order).c_str());
+        ofr_setenv("OFR_ODIDX", std::to_string(cfg.od_idx).c_str());
 
         std::vector<uint8_t> ofr;
         bool ok = (channels == 2) ? ofr_encode_stereo(samples.data(), nvals / 2, r, bps, ofr)

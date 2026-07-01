@@ -1,5 +1,7 @@
 #include <iostream>
 #include <vector>
+#include <cstdint>
+#include <cstdio>
 #include "OptimFROG.h"
 
 int main(int argc, char** argv) {

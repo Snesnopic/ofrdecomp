@@ -7,6 +7,15 @@
 #include <string>
 #include <vector>
 
+// setenv is POSIX-only; MSVC has no equivalent besides _putenv_s.
+static inline void ofr_setenv(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 static void enc_one(const std::vector<int32_t>& s, uint32_t nvals, uint32_t rate, int ch, int bps, std::vector<uint8_t>& out) {
     if (ch == 2) ofr_encode_stereo(s.data(), nvals / 2, rate, bps, out);
     else ofr_encode_mono(s.data(), nvals, rate, bps, out);
@@ -38,7 +47,7 @@ int main(int argc, char** argv) {
         // search a small set of safe configs, keep the smallest (all paths are verified lossless)
         std::vector<uint8_t> best;
         std::string best_desc;
-        auto setenvi = [](const char* k, int v){ char b[16]; snprintf(b,16,"%d",v); setenv(k,b,1); };
+        auto setenvi = [](const char* k, int v){ char b[16]; snprintf(b,16,"%d",v); ofr_setenv(k,b); };
         // pred=1 orders (mono up to 96 safe; stereo via od_idx 0/1) x ent 1/2/3, plus pred=3 x ent
         int mono_orders[] = {24, 64, 96};
         int st_odidx[]    = {0, 1};

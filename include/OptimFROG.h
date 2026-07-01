@@ -82,10 +82,12 @@ OptimFROG_Info;
 typedef void (*OptimFROG_callBack)(void* callBackParam, Float64_t percentage);
 
 
+#ifndef IMPORT_SYMBOL
 #if defined(CFG_MSCVER_WIN32_MIX86) || defined(CFG_BORLANDC_WIN32_MIX86) || defined(CFG_GNUC_MINGW32_I386) || defined(CFG_GNUC_CYGWIN_I386) || defined(CFG_MSCVER_WIN64_MX64)
 #define IMPORT_SYMBOL __declspec(dllimport)
 #else
 #define IMPORT_SYMBOL
+#endif
 #endif
 
 

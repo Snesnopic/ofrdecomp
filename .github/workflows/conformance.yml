@@ -10,6 +10,12 @@ name: Conformance
 # exercised locally by maintainers only (see tests/conformance/run.sh).
 #
 # Linux job: runs BOTH directions natively, no wine/emulation needed.
+#
+# Both jobs additionally run the Float (.off) decoder suite (tests/conformance/run_float.sh):
+# the official `off` encoder produces test files, our decoder decodes them, and the result must
+# equal the original raw float32 PCM bit-for-bit. No reference *decoder* is involved there (the
+# shared libOptimFROG library cannot open .off files at all), so this doesn't depend on which
+# direction the main lossless suite runs in.
 
 on:
   push:
@@ -36,7 +42,10 @@ jobs:
           actual=$(shasum -a 1 "$RUNNER_TEMP/ofr.zip" | awk '{print $1}')
           [ "$expected" = "$actual" ] || { echo "sha1 mismatch: expected $expected got $actual"; exit 1; }
           unzip -q "$RUNNER_TEMP/ofr.zip" -d "$RUNNER_TEMP/ofr_ref"
-          echo "OFR_REF_LIBDIR=$RUNNER_TEMP/ofr_ref/OptimFROG_OSX_x64_5100/SDK/Library" >> "$GITHUB_ENV"
+          DIR="$RUNNER_TEMP/ofr_ref/OptimFROG_OSX_x64_5100"
+          chmod +x "$DIR/off"
+          echo "OFR_REF_LIBDIR=$DIR/SDK/Library" >> "$GITHUB_ENV"
+          echo "OFF_REF=$DIR/off" >> "$GITHUB_ENV"
 
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -71,6 +80,13 @@ jobs:
           SYNTH_PRESETS: "0 2 4 7 10 max"
         run: bash tests/conformance/run.sh
 
+      - name: Run Float (.off) decoder conformance suite
+        env:
+          OFF: ${{ env.OFF_REF }}
+          OFR_DECODER: ${{ github.workspace }}/build/ofr
+          WORK: /tmp/conformance_float
+        run: bash tests/conformance/run_float.sh
+
   conformance-linux:
     name: Conformance (Linux x64, both directions)
     runs-on: ubuntu-latest
@@ -89,9 +105,10 @@ jobs:
           [ "$expected" = "$actual" ] || { echo "sha1 mismatch: expected $expected got $actual"; exit 1; }
           unzip -q "$RUNNER_TEMP/ofr.zip" -d "$RUNNER_TEMP/ofr_ref"
           DIR="$RUNNER_TEMP/ofr_ref/OptimFROG_Linux_x64_5100"
-          chmod +x "$DIR/ofr"
+          chmod +x "$DIR/ofr" "$DIR/off"
           echo "OFR_REF=$DIR/ofr" >> "$GITHUB_ENV"
           echo "OFR_REF_LIBDIR=$DIR/SDK/Library" >> "$GITHUB_ENV"
+          echo "OFF_REF=$DIR/off" >> "$GITHUB_ENV"
 
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -135,3 +152,10 @@ jobs:
           SYNTH_PRESETS: "0 2"
           SYNTH_BMODES: "default ent2"
         run: bash tests/conformance/run.sh
+
+      - name: Run Float (.off) decoder conformance suite
+        env:
+          OFF: ${{ env.OFF_REF }}
+          OFR_DECODER: ${{ github.workspace }}/build/ofr
+          WORK: /tmp/conformance_float
+        run: bash tests/conformance/run_float.sh

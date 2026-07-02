@@ -1,16 +1,15 @@
 name: Conformance
 
-# Bidirectional proof against the official reference codec.
+# Bidirectional proof against the official reference codec. Both jobs download
+# the official build straight from losslessaudio.org at run time (verified by
+# its published sha1, never committed to this repo -- nothing here is
+# redistributed).
 #
-# macOS job: uses libOptimFROG.0.dylib (x86_64 Mach-O, committed at the repo
-# root). Only direction B (our encoder -> reference decoder) runs here: the
-# official `ofr` encoder binary for macOS isn't in this repo, so direction A
-# is exercised locally by maintainers only (see tests/conformance/run.sh).
+# macOS job: only direction B (our encoder -> reference decoder) runs here:
+# the official `ofr` encoder binary isn't fetched, so direction A is
+# exercised locally by maintainers only (see tests/conformance/run.sh).
 #
-# Linux job: downloads the official Linux x64 build straight from
-# losslessaudio.org at run time (verified by its published sha1, never
-# committed to this repo -- nothing here is redistributed) and runs BOTH
-# directions natively, no wine/emulation needed.
+# Linux job: runs BOTH directions natively, no wine/emulation needed.
 
 on:
   push:
@@ -27,6 +26,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Fetch official OptimFROG OSX x64 build (ephemeral, sha1-verified, never redistributed)
+        run: |
+          curl -sL -o "$RUNNER_TEMP/ofr.zip" \
+              http://losslessaudio.org/Downloads/A1C0/5100/OSX/OptimFROG_OSX_x64_5100.zip
+          curl -sL -o "$RUNNER_TEMP/ofr.zip.sha1" \
+              http://losslessaudio.org/Downloads/A1C0/5100/OSX/OptimFROG_OSX_x64_5100.zip.sha1
+          expected=$(awk '{print $1}' "$RUNNER_TEMP/ofr.zip.sha1")
+          actual=$(shasum -a 1 "$RUNNER_TEMP/ofr.zip" | awk '{print $1}')
+          [ "$expected" = "$actual" ] || { echo "sha1 mismatch: expected $expected got $actual"; exit 1; }
+          unzip -q "$RUNNER_TEMP/ofr.zip" -d "$RUNNER_TEMP/ofr_ref"
+          echo "OFR_REF_LIBDIR=$RUNNER_TEMP/ofr_ref/OptimFROG_OSX_x64_5100/SDK/Library" >> "$GITHUB_ENV"
+
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
@@ -40,20 +51,20 @@ jobs:
             got=$(python3 -c "import hashlib;print(hashlib.md5(open('test.raw','rb').read()).hexdigest())")
             [ "$got" = "$2" ] || { echo "MD5 mismatch for $1: got $got want $2"; exit 1; }
           }
-          check sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
-          check test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
+          check tests/sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
+          check tests/test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
 
       - name: Build reference decoder wrapper
         run: |
           clang -arch x86_64 -I include tests/conformance/ref_gen.c \
-              libOptimFROG.0.dylib -o /tmp/ref_gen
+              "$OFR_REF_LIBDIR/libOptimFROG.0.dylib" -o "$RUNNER_TEMP/ref_gen"
 
       - name: Run conformance suite (direction B, synthetic corpus only)
         env:
           OFRENC: ${{ github.workspace }}/build/ofrenc
           ODEC: ${{ github.workspace }}/build/optimfrogcpp
-          REFGEN: /tmp/ref_gen
-          DYLIBDIR: ${{ github.workspace }}
+          REFGEN: ${{ runner.temp }}/ref_gen
+          DYLIBDIR: ${{ env.OFR_REF_LIBDIR }}
           NFILES: 0
           SKIP_DIRA: 1
           BPSLIST: "8 16 24 32"
@@ -95,8 +106,8 @@ jobs:
             got=$(python3 -c "import hashlib;print(hashlib.md5(open('test.raw','rb').read()).hexdigest())")
             [ "$got" = "$2" ] || { echo "MD5 mismatch for $1: got $got want $2"; exit 1; }
           }
-          check sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
-          check test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
+          check tests/sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
+          check tests/test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
 
       - name: Build reference decoder wrapper (against the official libOptimFROG.so.0)
         run: |

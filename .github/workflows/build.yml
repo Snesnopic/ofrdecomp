@@ -71,8 +71,8 @@ jobs:
             got=$(python3 -c "import hashlib;print(hashlib.md5(open('test.raw','rb').read()).hexdigest())")
             [ "$got" = "$2" ] || { echo "MD5 mismatch for $1: got $got want $2"; exit 1; }
           }
-          check sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
-          check test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
+          check tests/sine_mono.ofr 4c820520d7faa9b2e11c76e9c4d2d7c7
+          check tests/test_stereo.ofr 63c303b47bda85ba2a0029f71cfba1d5
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v7

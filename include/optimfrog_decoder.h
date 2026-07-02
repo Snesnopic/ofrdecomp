@@ -677,6 +677,13 @@ public:
     // open(). Each COMP block is independently decodable (fresh predictor/entropy/post-processor
     // init), so seeking is: rewind here, then decode-and-discard forward to the target sample.
     uint32_t comp_start_offset = 0;
+
+    // IEEE Float (.off, "OFRX" magic) support: the COMP block's pred1/ent2/post1 pipeline decodes
+    // a per-block array of scaled integers exactly like a normal bitspersample=32 file; a "DETA"
+    // sub-block immediately following each COMP block carries the info needed to reconstruct the
+    // original float bit patterns from those integers (see optimfrog_decoder_float.cpp).
+    bool is_float = false;
+    void reconstruct_float_block(int32_t* buf, uint32_t count);
 };
 
 

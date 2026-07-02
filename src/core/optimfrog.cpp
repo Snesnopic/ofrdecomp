@@ -329,11 +329,21 @@ sInt32_t OptimFROG_read(void* decoderInstance, void* data, uInt32_t noPoints, co
                 ((uint8_t*)data)[i*2+1] = (val >> 24) & 0xFF;
             }
         }
+    } else if (stype == 8 || stype == 9 || stype == 10) { // FLOAT32_*: temp_buffer already holds
+        // the reconstructed IEEE754 bit pattern per sample (see OFR_DecoderEngine::
+        // reconstruct_float_block) -- just pack it as a native little-endian float32 container.
+        for (sInt64_t i = 0; i < samples_read; ++i) {
+            int32_t val = temp_buffer[i];
+            ((uint8_t*)data)[i*4] = val & 0xFF;
+            ((uint8_t*)data)[i*4+1] = (val >> 8) & 0xFF;
+            ((uint8_t*)data)[i*4+2] = (val >> 16) & 0xFF;
+            ((uint8_t*)data)[i*4+3] = (val >> 24) & 0xFF;
+        }
     } else {
         free(temp_buffer);
         return -1;
     }
-    
+
     free(temp_buffer);
     instance->points_read_so_far += points_read;
     return points_read;

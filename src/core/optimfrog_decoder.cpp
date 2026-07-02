@@ -93,10 +93,11 @@ bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
     
     int limit = 0x100000;
     while (limit > 0) {
-        if (magic == 0x2052464f) break; // 'OFR '
+        if (magic == 0x2052464f || magic == 0x5852464f) break; // 'OFR ' or 'OFRX' (IEEE float)
         magic = (magic >> 8) | ((uint32_t)bs->readU8() << 24);
         limit--;
     }
+    this->is_float = (magic == 0x5852464f);
     
     uint32_t size = bs->readU32();
     
@@ -127,6 +128,7 @@ bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
     else if (this->sample_type == 2 || this->sample_type == 3) this->bitspersample = 16;
     else if (this->sample_type == 4 || this->sample_type == 5) this->bitspersample = 24;
     else if (this->sample_type == 6 || this->sample_type == 7) this->bitspersample = 32;
+    else if (this->sample_type == 8 || this->sample_type == 9 || this->sample_type == 10) this->bitspersample = 32; // FLOAT32_*
     else this->bitspersample = 16; // fallback
     
     // channels mapped from channelConfig
@@ -330,6 +332,21 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             this->block_pos = 0;
             this->need_new_block = false;
             this->block_error = false;
+
+            // Float files: the "DETA" sub-block immediately follows this COMP block's on-disk
+            // payload and must be parsed sequentially right after it, so the whole block's worth
+            // of integers has to be decoded eagerly here (not incrementally per read() call like
+            // the lossless path) before any samples can be handed back to the caller.
+            if (this->is_float && !this->block_error) {
+                uint32_t total = this->block_size * this->channels;
+                this->block_decoder.decode_block((uint32_t*)this->decode_buffer, total, &this->range_coder);
+
+                bs->range_budget = -1;
+                uint32_t consumed = bs->tell() - this->m_payload_start;
+                for (uint32_t k = consumed; k < this->m_payload_len; ++k) bs->readU8();
+
+                this->reconstruct_float_block(this->decode_buffer, total);
+            }
         }
 
         uint32_t remaining_in_block = this->block_size - this->block_pos;
@@ -342,7 +359,12 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
         int32_t* dest_ptr = (int32_t*)dest + (size_t)read_so_far * this->channels;
 
         if (!this->block_error) {
-            this->block_decode(dest_ptr, to_read);
+            if (this->is_float) {
+                memcpy(dest_ptr, this->decode_buffer + (size_t)this->block_pos * this->channels,
+                       (size_t)to_read * this->channels * sizeof(int32_t));
+            } else {
+                this->block_decode(dest_ptr, to_read);
+            }
 
             if (!this->block_error) {
                 read_so_far += to_read;
@@ -357,11 +379,13 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
         this->samples_read_so_far += to_read;
 
         if (this->block_pos == this->block_size) {
-            // realign to the next COMP: skip any payload bytes the range coder didn't consume
-            // (it stops at/under the budget; the next COMP starts exactly at payload_start+payload_len).
-            bs->range_budget = -1;
-            uint32_t consumed = bs->tell() - this->m_payload_start;
-            for (uint32_t k = consumed; k < this->m_payload_len; ++k) bs->readU8();
+            if (!this->is_float) {
+                // realign to the next COMP: skip any payload bytes the range coder didn't consume
+                // (it stops at/under the budget; the next COMP starts exactly at payload_start+payload_len).
+                bs->range_budget = -1;
+                uint32_t consumed = bs->tell() - this->m_payload_start;
+                for (uint32_t k = consumed; k < this->m_payload_len; ++k) bs->readU8();
+            }
             this->need_new_block = true;
         }
 

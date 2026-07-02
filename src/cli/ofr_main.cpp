@@ -255,6 +255,8 @@ void print_help() {
         "  --sampletype {UINT8|SINT8|UINT16|SINT16|UINT24|SINT24|UINT32|SINT32}\n"
         "                        required with --raw for --encode\n"
         "  --rate frequency      required with --raw for --encode\n"
+        "  --headersize size     (--raw --encode) save the first size bytes as an opaque header\n"
+        "  --tailsize size       (--raw --encode) save the last size bytes as an opaque tail\n"
         "  --output path         destination for the previous source file\n"
         "  --overwrite           overwrite an existing destination file\n"
         "  --silent              suppress the per-file progress line\n"
@@ -288,10 +290,11 @@ struct SrcDst { std::string src, dst; };
 
 int do_encode(const std::vector<SrcDst>& files, const std::string& preset, bool raw,
               const std::string& channelconfig, const std::string& sampletype, uint32_t rate,
-              bool overwrite, bool silent, bool verbose, bool want_md5, bool show_time) {
+              bool overwrite, bool silent, bool verbose, bool want_md5, bool show_time,
+              uint32_t headersize, uint32_t tailsize) {
     for (const auto& fd : files) {
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<uint8_t> pcm;
+        std::vector<uint8_t> pcm, head, tail;
         uint32_t r = rate; int channels = 1, bps = 16;
         if (raw) {
             if (channelconfig.empty() || sampletype.empty() || rate == 0) {
@@ -304,7 +307,19 @@ int do_encode(const std::vector<SrcDst>& files, const std::string& preset, bool 
             if (!f) { fprintf(stderr, "error: cannot open %s\n", fd.src.c_str()); return 1; }
             fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
             pcm.resize(sz); fread(pcm.data(), 1, sz, f); fclose(f);
+            if ((size_t)headersize + tailsize > pcm.size()) {
+                fprintf(stderr, "error: --headersize + --tailsize exceeds file size for %s\n", fd.src.c_str());
+                return 1;
+            }
+            if (headersize > 0) head.assign(pcm.begin(), pcm.begin() + headersize);
+            if (tailsize > 0) tail.assign(pcm.end() - tailsize, pcm.end());
+            if (headersize > 0 || tailsize > 0)
+                pcm.assign(pcm.begin() + headersize, pcm.end() - tailsize);
         } else {
+            if (headersize > 0 || tailsize > 0) {
+                fprintf(stderr, "error: --headersize/--tailsize require --raw\n");
+                return 1;
+            }
             WavInfo wi;
             if (!wav_read(fd.src, pcm, wi)) { fprintf(stderr, "error: cannot read WAV %s\n", fd.src.c_str()); return 1; }
             r = wi.rate; channels = wi.channels; bps = wi.bits;
@@ -330,8 +345,8 @@ int do_encode(const std::vector<SrcDst>& files, const std::string& preset, bool 
         ofr_setenv("OFR_ODIDX", std::to_string(cfg.od_idx).c_str());
 
         std::vector<uint8_t> ofr;
-        bool ok = (channels == 2) ? ofr_encode_stereo(samples.data(), nvals / 2, r, bps, ofr)
-                                   : ofr_encode_mono(samples.data(), nvals, r, bps, ofr);
+        bool ok = (channels == 2) ? ofr_encode_stereo(samples.data(), nvals / 2, r, bps, ofr, head, tail)
+                                   : ofr_encode_mono(samples.data(), nvals, r, bps, ofr, head, tail);
         if (!ok) { fprintf(stderr, "error: encode failed for %s\n", fd.src.c_str()); return 1; }
 
         if (want_md5) {
@@ -383,12 +398,25 @@ int do_decode(const std::vector<SrcDst>& files, bool raw, bool overwrite, bool s
             memcpy(&pcm[done * info.channels * bpv], buf.data(), (size_t)got * info.channels * bpv);
             done += got;
         }
+        // HEAD/TAIL, restored verbatim around the PCM for --raw output (matches how
+        // --headersize/--tailsize sliced them off at encode time).
+        std::vector<uint8_t> headBytes, tailBytes;
+        if (raw) {
+            uint32_t headSize = (uint32_t)OptimFROG_readHead(inst, nullptr, 0);
+            if (headSize > 0) { headBytes.resize(headSize); OptimFROG_readHead(inst, headBytes.data(), headSize); }
+            std::vector<uint8_t> tailBuf(1u << 20); // generous bound; readTail can't be size-queried first
+            sInt32_t tailRet = OptimFROG_readTail(inst, tailBuf.data(), (uint32_t)tailBuf.size());
+            if (tailRet > 0) tailBytes.assign(tailBuf.begin(), tailBuf.begin() + tailRet);
+        }
         OptimFROG_close(inst); OptimFROG_destroyInstance(inst);
 
         if (raw) {
             FILE* out = fopen(fd.dst.c_str(), "wb");
             if (!out) { fprintf(stderr, "error: cannot write %s\n", fd.dst.c_str()); return 1; }
-            fwrite(pcm.data(), 1, pcm.size(), out); fclose(out);
+            fwrite(headBytes.data(), 1, headBytes.size(), out);
+            fwrite(pcm.data(), 1, pcm.size(), out);
+            fwrite(tailBytes.data(), 1, tailBytes.size(), out);
+            fclose(out);
         } else {
             wav_write(fd.dst, pcm.data(), pcm.size(), info.samplerate, (uint16_t)info.channels, (uint16_t)info.bitspersample);
         }
@@ -428,6 +456,7 @@ int main(int argc, char** argv) {
     std::string preset, channelconfig, sampletype;
     uint32_t rate = 0;
     bool raw = false, overwrite = false, silent = false, verbose = false, want_md5 = false, show_time = false;
+    uint32_t headersize = 0, tailsize = 0;
     std::vector<SrcDst> files;
     std::vector<std::string> info_srcs;
     std::string pending_src;
@@ -462,6 +491,8 @@ int main(int argc, char** argv) {
         else if (a == "--channelconfig" && i + 1 < argc) { channelconfig = argv[++i]; }
         else if (a == "--sampletype" && i + 1 < argc) { sampletype = argv[++i]; }
         else if (a == "--rate" && i + 1 < argc) { rate = (uint32_t)atoi(argv[++i]); }
+        else if (a == "--headersize" && i + 1 < argc) { headersize = (uint32_t)atoi(argv[++i]); }
+        else if (a == "--tailsize" && i + 1 < argc) { tailsize = (uint32_t)atoi(argv[++i]); }
         else if (a == "--output" && i + 1 < argc) { flush_pending(argv[++i]); }
         else if (a.size() > 2 && a[0] == '-' && a[1] == '-') { fprintf(stderr, "warning: ignoring unrecognized option %s\n", a.c_str()); }
         else { flush_pending(""); pending_src = a; }
@@ -469,7 +500,7 @@ int main(int argc, char** argv) {
     flush_pending("");
 
     if (command == HELP || command == NONE) { print_help(); return command == HELP ? 0 : 1; }
-    if (command == ENCODE) return do_encode(files, preset, raw, channelconfig, sampletype, rate, overwrite, silent, verbose, want_md5, show_time);
+    if (command == ENCODE) return do_encode(files, preset, raw, channelconfig, sampletype, rate, overwrite, silent, verbose, want_md5, show_time, headersize, tailsize);
     if (command == DECODE) return do_decode(files, raw, overwrite, silent, verbose, show_time);
     if (command == INFO) return do_info(info_srcs);
     if (command == VERIFY) return do_verify(info_srcs, verbose);

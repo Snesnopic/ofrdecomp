@@ -279,7 +279,8 @@ static uint8_t sample_type_for_bps(int bps) {
     switch (bps) { case 8: return 1; case 16: return 3; case 24: return 5; case 32: return 7; default: return 3; }
 }
 
-bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, int bps, std::vector<uint8_t>& file) {
+bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, int bps, std::vector<uint8_t>& file,
+                      const std::vector<uint8_t>& head, const std::vector<uint8_t>& tail) {
     crc32_init();
     int mn = 0x7fffffff, mx = -0x7fffffff - 1;
     for (uint32_t i = 0; i < n; i++) { int v = samples[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
@@ -427,9 +428,10 @@ bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, in
     put16(file, 0x2585);                      // encoder ID (informational)
     file.push_back(0x02);                     // compression
     put16(file, 20);                          // minDecoderVersion - 4500
-    // HEAD block (empty)
+    // HEAD block
     file.push_back('H'); file.push_back('E'); file.push_back('A'); file.push_back('D');
-    put32(file, 0);
+    put32(file, (uint32_t)head.size());
+    file.insert(file.end(), head.begin(), head.end());
     // COMP block
     uint16_t reserved = ((uint16_t)ENT << 11) | ((uint16_t)PRED << 6) | 1u;   // ent, pred, post=1
     std::vector<uint8_t> payload;                       // D-4 bytes (everything after CRC field)
@@ -446,14 +448,16 @@ bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, in
     put32(file, D);
     put32(file, crc);
     file.insert(file.end(), payload.begin(), payload.end());
-    // TAIL block (empty)
+    // TAIL block
     file.push_back('T'); file.push_back('A'); file.push_back('I'); file.push_back('L');
-    put32(file, 0);
+    put32(file, (uint32_t)tail.size());
+    file.insert(file.end(), tail.begin(), tail.end());
     return true;
 }
 
 // interleaved L/R, pred=1/3 stereo / ent=1/2/3 / post=1 identity
-bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t samplerate, int bps, std::vector<uint8_t>& file) {
+bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t samplerate, int bps, std::vector<uint8_t>& file,
+                        const std::vector<uint8_t>& head, const std::vector<uint8_t>& tail) {
     crc32_init();
     int mnL = 0x7fffffff, mxL = -0x7fffffff-1, mnR = 0x7fffffff, mxR = -0x7fffffff-1;
     for (uint32_t i = 0; i < frames; i++) {
@@ -621,7 +625,8 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
     put32(file, samplerate);
     put16(file, 0x2585); file.push_back(0x02); put16(file, 20);
     file.push_back('H'); file.push_back('E'); file.push_back('A'); file.push_back('D');
-    put32(file, 0);
+    put32(file, (uint32_t)head.size());
+    file.insert(file.end(), head.begin(), head.end());
     uint16_t reserved = ((uint16_t)ENT << 11) | ((uint16_t)PRED << 6) | 1u;
     std::vector<uint8_t> payload;
     auto p32 = [&](uint32_t v){ payload.push_back(v); payload.push_back(v>>8); payload.push_back(v>>16); payload.push_back(v>>24); };
@@ -636,7 +641,8 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
     put32(file, D); put32(file, crc);
     file.insert(file.end(), payload.begin(), payload.end());
     file.push_back('T'); file.push_back('A'); file.push_back('I'); file.push_back('L');
-    put32(file, 0);
+    put32(file, (uint32_t)tail.size());
+    file.insert(file.end(), tail.begin(), tail.end());
     return true;
 }
 

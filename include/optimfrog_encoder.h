@@ -6,8 +6,12 @@
 #include "optimfrog_decoder.h"
 
 // public encoder entry points (implemented in src/core/optimfrog_encoder.cpp)
-bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, int bps, std::vector<uint8_t>& file);
-bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t samplerate, int bps, std::vector<uint8_t>& file);
+// head/tail: opaque bytes embedded verbatim in the HEAD/TAIL container blocks (--headersize/
+// --tailsize equivalents), restored bit-exact around the decoded PCM at decode time.
+bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, int bps, std::vector<uint8_t>& file,
+                      const std::vector<uint8_t>& head = {}, const std::vector<uint8_t>& tail = {});
+bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t samplerate, int bps, std::vector<uint8_t>& file,
+                        const std::vector<uint8_t>& head = {}, const std::vector<uint8_t>& tail = {});
 
 // range encoder: exact dual of OFR_RangeCoder (decoder). 31-bit window to match the
 // decoder's post-init range of 0x80000000 (7-bit init + byte renorm at 0x800001).

@@ -142,12 +142,11 @@ bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
     uint32_t headMagic = bs->readU32();
     if (headMagic == 0x44414548) { // "HEAD"
         this->headSize = bs->readU32();
-        if (this->headData) {
+        if (this->headSize > 0) {
+            this->headData = new uint8_t[this->headSize];
             bs->readBytes(this->headData, this->headSize);
-        } else {
-            for(uint32_t i=0; i<this->headSize; i++) bs->readU8();
         }
-        
+
         this->tailSize = 0;
         this->has_recoverable_errors = false;
         this->decode_buffer = new int32_t[1024 * 1024];
@@ -369,5 +368,15 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
     return read_so_far;
 }
 bool OFR_DecoderEngine::seek(sInt64_t) { return false; }
-bool OFR_DecoderEngine::readTail() { return false; }
+bool OFR_DecoderEngine::readTail() {
+    OFR_BitStream* bs = this->bitstream;
+    uint32_t magic = bs->readU32();
+    if (magic != 0x4c494154) return false; // "TAIL"
+    this->tailSize = bs->readU32();
+    if (this->tailSize > 0) {
+        this->tailData = new uint8_t[this->tailSize];
+        bs->readBytes(this->tailData, this->tailSize);
+    }
+    return true;
+}
 void OFR_DecoderEngine::close() {}

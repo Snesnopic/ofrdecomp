@@ -216,7 +216,9 @@ sInt32_t OptimFROG_readTail(void* decoderInstance, void* tailData, uInt32_t maxS
 condition_t OptimFROG_seekable(void* decoderInstance) {
     auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
     if (!instance || !instance->pInterface) return C_FALSE;
-    return C_TRUE;
+    OFR_BitStream* bs = instance->pInterface->bitstream;
+    if (!bs || !bs->wrapper) return C_FALSE;
+    return bs->wrapper->rInt->seekable(bs->wrapper->readerInstance);
 }
 
 condition_t OptimFROG_seekPoint(void* decoderInstance, sInt64_t point) {
@@ -224,16 +226,18 @@ condition_t OptimFROG_seekPoint(void* decoderInstance, sInt64_t point) {
     if (!instance || !instance->is_opened || !instance->pInterface) return C_FALSE;
     
     auto* pInt = instance->pInterface;
+    // points_read_so_far tracks FRAMES throughout this file (see OptimFROG_read's clamp/
+    // increment below) -- total_samples is the one field in "values" (frames*channels).
     sInt64_t sample_pos = point * pInt->channels;
-    
+
     if (sample_pos < pInt->total_samples) {
-        if (pInt->seek(sample_pos)) {
-            instance->points_read_so_far = sample_pos;
+        if (pInt->seek(point)) {
+            instance->points_read_so_far = point;
             return C_TRUE;
         }
     }
-    
-    instance->points_read_so_far = pInt->total_samples;
+
+    instance->points_read_so_far = instance->noPoints;
     return C_FALSE;
 }
 
@@ -246,8 +250,8 @@ condition_t OptimFROG_seekTime(void* decoderInstance, sInt64_t milliseconds) {
 
 sInt64_t OptimFROG_getPos(void* decoderInstance) {
     auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->pInterface || instance->pInterface->channels == 0) return 0;
-    return instance->points_read_so_far / instance->pInterface->channels;
+    if (!instance || !instance->pInterface) return 0;
+    return instance->points_read_so_far; // already frames, see OptimFROG_read/seekPoint
 }
 
 condition_t OptimFROG_recoverableErrors(void* decoderInstance) {

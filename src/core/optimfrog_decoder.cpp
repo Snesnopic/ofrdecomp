@@ -2,6 +2,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <vector>
 
 // FUN_00018d80: bit-length of the data range (min,max) → entropy bit depth / shift source
 static int ofr_bitlen(int mn, int mx) {
@@ -152,7 +153,8 @@ bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
         this->decode_buffer = new int32_t[1024 * 1024];
         this->samples_read_so_far = 0;
         this->need_new_block = true;
-        
+        this->comp_start_offset = bs->tell();
+
         return true;
     }
     
@@ -367,7 +369,35 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
 
     return read_so_far;
 }
-bool OFR_DecoderEngine::seek(sInt64_t) { return false; }
+bool OFR_DecoderEngine::seek(sInt64_t frame_pos) {
+    // frame_pos is a frame index (matches samples_read_so_far's unit -- see read()/block_decode,
+    // which advance it by frame counts, not by frames*channels).
+    sInt64_t total_frames = this->channels ? this->total_samples / this->channels : 0;
+    if (frame_pos < 0) frame_pos = 0;
+    if (frame_pos > total_frames) frame_pos = total_frames;
+
+    OFR_BitStream* bs = this->bitstream;
+    if (!bs || !bs->wrapper || !bs->wrapper->rInt->seekable(bs->wrapper->readerInstance)) return false;
+    if (!bs->seek(this->comp_start_offset)) return false;
+
+    this->need_new_block = true;
+    this->samples_read_so_far = 0;
+    this->has_recoverable_errors = false;
+
+    // Every COMP block is independently decodable (fresh predictor/entropy/post-processor
+    // init on each new-block transition), so seeking is just: rewind to the first COMP block,
+    // then decode-and-discard forward to the target frame via the normal read() path -- this
+    // reuses the exact same block-boundary/state-reset logic as a plain linear decode.
+    const uInt32_t CHUNK = 65536;
+    std::vector<int32_t> scratch((size_t)CHUNK * (this->channels ? this->channels : 1));
+    while (this->samples_read_so_far < frame_pos) {
+        sInt64_t remaining_frames = frame_pos - this->samples_read_so_far;
+        uInt32_t want_frames = (uInt32_t)std::min<sInt64_t>(CHUNK, remaining_frames);
+        uInt32_t got = this->read(scratch.data(), want_frames);
+        if (got == 0) break;
+    }
+    return this->samples_read_so_far == frame_pos;
+}
 bool OFR_DecoderEngine::readTail() {
     OFR_BitStream* bs = this->bitstream;
     uint32_t magic = bs->readU32();

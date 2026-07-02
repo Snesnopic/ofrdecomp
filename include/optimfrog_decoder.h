@@ -65,6 +65,17 @@ public:
     uint32_t tell() const {
         return total_read;
     }
+
+    // absolute byte seek on the underlying reader; discards the read-ahead buffer, which is
+    // now stale, and range_budget (only meaningful mid-COMP-payload, never spans a seek).
+    bool seek(uint64_t byte_pos) {
+        if (!wrapper->rInt->seek(wrapper->readerInstance, (sInt64_t)byte_pos)) return false;
+        buf_pos = 0;
+        buf_avail = 0;
+        total_read = byte_pos;
+        range_budget = -1;
+        return true;
+    }
 };
 
 
@@ -661,6 +672,11 @@ public:
     // realign to the next COMP after the block (the range coder otherwise over-reads).
     uint32_t m_payload_start = 0;
     uint32_t m_payload_len = 0;
+
+    // seek support: byte offset of the first COMP block (right after HEAD), recorded once in
+    // open(). Each COMP block is independently decodable (fresh predictor/entropy/post-processor
+    // init), so seeking is: rewind here, then decode-and-discard forward to the target sample.
+    uint32_t comp_start_offset = 0;
 };
 
 

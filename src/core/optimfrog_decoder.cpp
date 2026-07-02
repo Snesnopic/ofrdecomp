@@ -325,11 +325,19 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                 this->block_decoder.predictor_dualstream_mono->init(
                     &this->range_coder, mn, mx, data_bits, (int)uncompressed_size);
             } else if (pred_type == 4 && this->channels == 2) {
-                // DualStream (.ofs) stereo pred_type=4 is not implemented yet -- fail loudly
-                // instead of silently emitting unpredicted entropy residuals as if they were
-                // final samples.
-                this->has_recoverable_errors = true;
-                this->block_error = true;
+                if (!this->block_decoder.predictor_dualstream_stereo) {
+                    this->block_decoder.predictor_dualstream_stereo = new OFR_PredictorDualStreamStereo();
+                }
+                OFR_PostProcessor* pp = this->block_decoder.post_processor;
+                int mnL = pp ? pp->scaled_min_L : -0x800000, mxL = pp ? pp->scaled_max_L : 0x7fffff;
+                int mnR = pp ? pp->scaled_min_R : -0x800000, mxR = pp ? pp->scaled_max_R : 0x7fffff;
+                // same "no clipping possible" rationale as the mono case above.
+                if (pp) {
+                    pp->min_val_L = -0x7fffffff; pp->max_val_L = 0x7fffffff;
+                    pp->min_val_R = -0x7fffffff; pp->max_val_R = 0x7fffffff;
+                }
+                this->block_decoder.predictor_dualstream_stereo->init(
+                    &this->range_coder, mnL, mxL, mnR, mxR, data_bits, (int)uncompressed_size);
             }
 
             // Entropy Coder

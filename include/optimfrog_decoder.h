@@ -506,6 +506,25 @@ struct OFR_PredictorDualStreamMono {
     void decode(int32_t* dest, uint32_t count);
 };
 
+// pred_type=4 stereo: embeds OFR_PredictorStereo_Inner (same cross-channel LDLT predictor as
+// pred_type=1/3 stereo) + TWO independent quantization-step schedules (one per channel, decoded
+// interleaved from a single shared 32-symbol context -- confirmed via RE of FUN_1000201b0/
+// FUN_1000206b0 in the ofs binary). Per-sample reconstruction mirrors the mono case, doubled.
+struct OFR_PredictorDualStreamStereo {
+    OFR_PredictorStereo_Inner main;
+    uint32_t main_weight_param = 0, main_max_order = 0, main_right_order = 0, main_interval = 0;
+    int min_L = 0, max_L = 0, min_R = 0, max_R = 0, shift = 0;
+
+    uint32_t weight_param = 0;
+    std::vector<int32_t> step_schedule_L, step_schedule_R;
+    uint32_t step_idx = 0;
+    int32_t current_step_L = 1, current_step_R = 1;
+    uint32_t sample_counter = 0;
+
+    void init(OFR_RangeCoder* rc, int Lmn, int Lmx, int Rmn, int Rmx, int dbits, int total);
+    void decode(int32_t* dest, uint32_t count);
+};
+
 // pred_type=3 stereo: OFR_PredictorStereo_Inner (main) + two cross-channel cascades.
 struct OFR_CascadeStageX {        // cross-channel NLMS stage
     std::vector<float> w1, w2;    // this-channel taps, other-channel taps
@@ -629,10 +648,11 @@ public:
     OFR_PredictorCascadeMono* predictor_cascade_mono;
     OFR_PredictorCascadeStereo* predictor_cascade_stereo;
     OFR_PredictorDualStreamMono* predictor_dualstream_mono;
+    OFR_PredictorDualStreamStereo* predictor_dualstream_stereo;
     OFR_EntropyAcm* entropy_acm;
     OFR_PostProcessor* post_processor;
 
-    OFR_BlockDecoder() : entropy(nullptr), predictor(nullptr), predictor_fast_stereo(nullptr), predictor_stereo(nullptr), predictor_cascade_mono(nullptr), predictor_cascade_stereo(nullptr), predictor_dualstream_mono(nullptr), entropy_acm(nullptr), post_processor(nullptr) {}
+    OFR_BlockDecoder() : entropy(nullptr), predictor(nullptr), predictor_fast_stereo(nullptr), predictor_stereo(nullptr), predictor_cascade_mono(nullptr), predictor_cascade_stereo(nullptr), predictor_dualstream_mono(nullptr), predictor_dualstream_stereo(nullptr), entropy_acm(nullptr), post_processor(nullptr) {}
 
     void decode_block(uint32_t* dest, uint32_t count, OFR_RangeCoder* rc) {
         if (entropy) entropy->decode_block((int32_t*)dest, count, rc);
@@ -646,6 +666,7 @@ public:
         if (predictor_cascade_mono) predictor_cascade_mono->decode((int32_t*)dest, count);
         if (predictor_cascade_stereo) predictor_cascade_stereo->decode((int32_t*)dest, count);
         if (predictor_dualstream_mono) predictor_dualstream_mono->decode((int32_t*)dest, count);
+        if (predictor_dualstream_stereo) predictor_dualstream_stereo->decode((int32_t*)dest, count);
         if (post_processor) post_processor->decode((int*)dest, count, post_processor->m_channels);
     }
 };

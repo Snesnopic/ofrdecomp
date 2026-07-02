@@ -10,6 +10,7 @@
 //   ofr --help
 #include "../../include/OptimFROG.h"
 #include "../../include/optimfrog_encoder.h"
+#include "../../include/md5.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 namespace {
 
@@ -85,6 +87,120 @@ bool wav_write(const std::string& path, const uint8_t* pcm, size_t pcm_bytes, ui
     return true;
 }
 
+// ---------------- raw container block scanner (--verify / --check) ----------------
+// Walks the OFR/HEAD/COMP*/TAIL/MD5 block structure directly on the raw file bytes,
+// independent of the decode engine -- --verify only needs each COMP block's declared
+// CRC32 to match, and --check only needs the trailing MD5 block's stored hash. Neither
+// requires actually decoding samples.
+
+static uint32_t crc32_table[256];
+static void crc32_init() {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        crc32_table[i] = c;
+    }
+}
+static uint32_t crc32_calc(const uint8_t* p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) c = crc32_table[(c ^ p[i]) & 0xff] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+struct ScanResult { bool ok = false; bool has_md5 = false; uint8_t md5[16] = {0}; std::string error; };
+
+ScanResult scan_ofr_file(const std::string& path) {
+    ScanResult r;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { r.error = "cannot open file"; return r; }
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> buf((size_t)fsz);
+    bool read_ok = fsz > 0 && fread(buf.data(), 1, (size_t)fsz, f) == (size_t)fsz;
+    fclose(f);
+    if (!read_ok) { r.error = "read error"; return r; }
+
+    auto rd_u32 = [&](size_t p) -> uint32_t {
+        return (uint32_t)buf[p] | ((uint32_t)buf[p+1] << 8) | ((uint32_t)buf[p+2] << 16) | ((uint32_t)buf[p+3] << 24);
+    };
+    size_t sz = buf.size();
+    if (sz < 8 || memcmp(&buf[0], "OFR ", 4) != 0) { r.error = "not an OFR file"; return r; }
+    uint32_t mainSize = rd_u32(4);
+    size_t pos = 8 + mainSize;
+    if (pos + 8 > sz || memcmp(&buf[pos], "HEAD", 4) != 0) { r.error = "malformed file (no HEAD block)"; return r; }
+    pos += 8 + rd_u32(pos + 4);
+
+    crc32_init();
+    while (pos + 8 <= sz && memcmp(&buf[pos], "COMP", 4) == 0) {
+        uint32_t D = rd_u32(pos + 4);
+        if (D < 4 || pos + 8 + D > sz) { r.error = "truncated COMP block"; return r; }
+        uint32_t storedCrc = rd_u32(pos + 8);
+        uint32_t actualCrc = crc32_calc(&buf[pos + 12], D - 4);
+        if (actualCrc != storedCrc) { r.error = "CRC32 mismatch in a COMP block"; return r; }
+        pos += 8 + D;
+    }
+    if (pos + 8 <= sz && memcmp(&buf[pos], "TAIL", 4) == 0) pos += 8 + rd_u32(pos + 4);
+
+    // optional trailing MD5/RECV blocks (order per format.txt: ['MD5 '] ['RECV'])
+    while (pos + 8 <= sz) {
+        if (memcmp(&buf[pos], "MD5 ", 4) == 0) {
+            uint32_t msz = rd_u32(pos + 4);
+            if (msz == 16 && pos + 8 + 16 <= sz) { r.has_md5 = true; memcpy(r.md5, &buf[pos + 8], 16); }
+            pos += 8 + msz;
+        } else if (memcmp(&buf[pos], "RECV", 4) == 0) {
+            pos += 8 + rd_u32(pos + 4);
+        } else {
+            break; // unsupported trailing block (APET/TAG/ID3...); nothing more we need here
+        }
+    }
+    r.ok = true;
+    return r;
+}
+
+int do_verify(const std::vector<std::string>& srcs, bool verbose) {
+    int failures = 0;
+    for (const auto& src : srcs) {
+        ScanResult r = scan_ofr_file(src);
+        if (r.ok) { if (verbose) fprintf(stderr, "%s: OK\n", src.c_str()); }
+        else { fprintf(stderr, "%s: FAILED (%s)\n", src.c_str(), r.error.c_str()); failures++; }
+    }
+    return failures ? 1 : 0;
+}
+
+int do_check(const std::vector<std::string>& srcs, bool verbose) {
+    int failures = 0;
+    for (const auto& src : srcs) {
+        ScanResult r = scan_ofr_file(src);
+        if (!r.ok) { fprintf(stderr, "%s: FAILED (%s)\n", src.c_str(), r.error.c_str()); failures++; continue; }
+        if (!r.has_md5) { fprintf(stderr, "%s: no MD5 signature stored (encode with --md5)\n", src.c_str()); failures++; continue; }
+
+        void* inst = OptimFROG_createInstance();
+        if (!inst || OptimFROG_open(inst, const_cast<char*>(src.c_str()), 0) != OptimFROG_NoError) {
+            fprintf(stderr, "%s: FAILED (cannot open for decode)\n", src.c_str()); failures++; continue;
+        }
+        OptimFROG_Info info; memset(&info, 0, sizeof(info));
+        OptimFROG_getInfo(inst, &info);
+        int bpv = info.bitspersample / 8;
+        MD5 md5;
+        const uint32_t CHUNK = 65536;
+        std::vector<uint8_t> chunkbuf((size_t)CHUNK * info.channels * bpv);
+        long long done = 0;
+        while (done < info.noPoints) {
+            uint32_t want = (uint32_t)std::min<long long>(CHUNK, info.noPoints - done);
+            int got = OptimFROG_read(inst, chunkbuf.data(), want, 0);
+            if (got <= 0) break;
+            md5.update(chunkbuf.data(), (size_t)got * info.channels * bpv);
+            done += got;
+        }
+        OptimFROG_close(inst); OptimFROG_destroyInstance(inst);
+
+        uint8_t computed[16]; md5.finish(computed);
+        bool match = memcmp(computed, r.md5, 16) == 0;
+        if (match) { if (verbose) fprintf(stderr, "%s: OK\n", src.c_str()); }
+        else { fprintf(stderr, "%s: FAILED (MD5 mismatch)\n", src.c_str()); failures++; }
+    }
+    return failures ? 1 : 0;
+}
+
 // ---------------- preset -> encoder config ladder ----------------
 // Not a bit-exact mirror of the reference's internal mode names (turbonew/highnew-light/...) --
 // those are the reference ENCODER's internal knobs, irrelevant to interop since any valid,
@@ -122,11 +238,15 @@ void print_help() {
         "  ofr --encode [options] src [--output dst] ...\n"
         "  ofr --decode [options] src [--output dst] ...\n"
         "  ofr --info src ...\n"
+        "  ofr --verify src ...\n"
+        "  ofr --check src ...\n"
         "  ofr --help\n"
         "\nCommands:\n"
         "  --encode              encode WAV/RAW file(s) to OFR file(s)\n"
         "  --decode              decode OFR file(s) to WAV/RAW file(s)\n"
         "  --info                print information about OFR file(s)\n"
+        "  --verify              quick integrity check (COMP block CRC32) of OFR file(s)\n"
+        "  --check               verify the stored MD5 of raw PCM input data (needs --md5 at encode time)\n"
         "  --help                this message\n"
         "\nOptions:\n"
         "  --preset level        0-10 or max (default: 2)\n"
@@ -137,7 +257,10 @@ void print_help() {
         "  --rate frequency      required with --raw for --encode\n"
         "  --output path         destination for the previous source file\n"
         "  --overwrite           overwrite an existing destination file\n"
-        "  --silent              suppress the per-file progress line\n");
+        "  --silent              suppress the per-file progress line\n"
+        "  --verbose             print extra per-file details\n"
+        "  --time                print elapsed time per operation\n"
+        "  --md5                 store an MD5 signature of the raw PCM input data (--encode)\n");
 }
 
 int sampletype_bits(const std::string& st, bool& is_signed) {
@@ -165,8 +288,9 @@ struct SrcDst { std::string src, dst; };
 
 int do_encode(const std::vector<SrcDst>& files, const std::string& preset, bool raw,
               const std::string& channelconfig, const std::string& sampletype, uint32_t rate,
-              bool overwrite, bool silent) {
+              bool overwrite, bool silent, bool verbose, bool want_md5, bool show_time) {
     for (const auto& fd : files) {
+        auto t0 = std::chrono::steady_clock::now();
         std::vector<uint8_t> pcm;
         uint32_t r = rate; int channels = 1, bps = 16;
         if (raw) {
@@ -209,16 +333,33 @@ int do_encode(const std::vector<SrcDst>& files, const std::string& preset, bool 
         bool ok = (channels == 2) ? ofr_encode_stereo(samples.data(), nvals / 2, r, bps, ofr)
                                    : ofr_encode_mono(samples.data(), nvals, r, bps, ofr);
         if (!ok) { fprintf(stderr, "error: encode failed for %s\n", fd.src.c_str()); return 1; }
+
+        if (want_md5) {
+            uint8_t hash[16]; md5_compute(pcm.data(), pcm.size(), hash);
+            const uint8_t blockId[4] = {'M','D','5',' '};
+            ofr.insert(ofr.end(), blockId, blockId + 4);
+            uint32_t hsz = 16;
+            ofr.push_back((uint8_t)(hsz)); ofr.push_back((uint8_t)(hsz >> 8));
+            ofr.push_back((uint8_t)(hsz >> 16)); ofr.push_back((uint8_t)(hsz >> 24));
+            ofr.insert(ofr.end(), hash, hash + 16);
+        }
+
         FILE* out = fopen(fd.dst.c_str(), "wb");
         if (!out) { fprintf(stderr, "error: cannot write %s\n", fd.dst.c_str()); return 1; }
         fwrite(ofr.data(), 1, ofr.size(), out); fclose(out);
+        if (verbose) fprintf(stderr, "%s: pred=%d ent=%d order=%d od_idx=%d\n", fd.src.c_str(), cfg.pred, cfg.ent, cfg.mono_order, cfg.od_idx);
         if (!silent) fprintf(stderr, "%s -> %s (%zu bytes)\n", fd.src.c_str(), fd.dst.c_str(), ofr.size());
+        if (show_time) {
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr, "%s: %.3fs\n", fd.src.c_str(), secs);
+        }
     }
     return 0;
 }
 
-int do_decode(const std::vector<SrcDst>& files, bool raw, bool overwrite, bool silent) {
+int do_decode(const std::vector<SrcDst>& files, bool raw, bool overwrite, bool silent, bool verbose, bool show_time) {
     for (const auto& fd : files) {
+        auto t0 = std::chrono::steady_clock::now();
         if (!overwrite && file_exists(fd.dst)) {
             fprintf(stderr, "error: %s exists (use --overwrite)\n", fd.dst.c_str());
             return 1;
@@ -251,7 +392,12 @@ int do_decode(const std::vector<SrcDst>& files, bool raw, bool overwrite, bool s
         } else {
             wav_write(fd.dst, pcm.data(), pcm.size(), info.samplerate, (uint16_t)info.channels, (uint16_t)info.bitspersample);
         }
+        if (verbose) fprintf(stderr, "%s: rate=%u ch=%u bits=%u\n", fd.src.c_str(), info.samplerate, info.channels, info.bitspersample);
         if (!silent) fprintf(stderr, "%s -> %s (%lld frames)\n", fd.src.c_str(), fd.dst.c_str(), (long long)info.noPoints);
+        if (show_time) {
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr, "%s: %.3fs\n", fd.src.c_str(), secs);
+        }
     }
     return 0;
 }
@@ -278,17 +424,17 @@ int do_info(const std::vector<std::string>& srcs) {
 int main(int argc, char** argv) {
     if (argc < 2) { print_help(); return 1; }
 
-    enum { NONE, ENCODE, DECODE, INFO, HELP } command = NONE;
+    enum { NONE, ENCODE, DECODE, INFO, VERIFY, CHECK, HELP } command = NONE;
     std::string preset, channelconfig, sampletype;
     uint32_t rate = 0;
-    bool raw = false, overwrite = false, silent = false;
+    bool raw = false, overwrite = false, silent = false, verbose = false, want_md5 = false, show_time = false;
     std::vector<SrcDst> files;
     std::vector<std::string> info_srcs;
     std::string pending_src;
 
     auto flush_pending = [&](const std::string& explicit_dst) {
         if (pending_src.empty()) return;
-        if (command == INFO) { info_srcs.push_back(pending_src); }
+        if (command == INFO || command == VERIFY || command == CHECK) { info_srcs.push_back(pending_src); }
         else {
             std::string dst = explicit_dst.empty()
                 ? default_output(pending_src, command == ENCODE ? ".ofr" : (raw ? ".raw" : ".wav"))
@@ -303,10 +449,15 @@ int main(int argc, char** argv) {
         if (a == "--encode") { command = ENCODE; }
         else if (a == "--decode") { command = DECODE; }
         else if (a == "--info") { command = INFO; }
+        else if (a == "--verify") { command = VERIFY; }
+        else if (a == "--check") { command = CHECK; }
         else if (a == "--help") { command = HELP; }
         else if (a == "--raw") { raw = true; }
         else if (a == "--overwrite") { overwrite = true; }
         else if (a == "--silent") { silent = true; }
+        else if (a == "--verbose") { verbose = true; }
+        else if (a == "--time") { show_time = true; }
+        else if (a == "--md5") { want_md5 = true; }
         else if (a == "--preset" && i + 1 < argc) { preset = argv[++i]; }
         else if (a == "--channelconfig" && i + 1 < argc) { channelconfig = argv[++i]; }
         else if (a == "--sampletype" && i + 1 < argc) { sampletype = argv[++i]; }
@@ -318,8 +469,10 @@ int main(int argc, char** argv) {
     flush_pending("");
 
     if (command == HELP || command == NONE) { print_help(); return command == HELP ? 0 : 1; }
-    if (command == ENCODE) return do_encode(files, preset, raw, channelconfig, sampletype, rate, overwrite, silent);
-    if (command == DECODE) return do_decode(files, raw, overwrite, silent);
+    if (command == ENCODE) return do_encode(files, preset, raw, channelconfig, sampletype, rate, overwrite, silent, verbose, want_md5, show_time);
+    if (command == DECODE) return do_decode(files, raw, overwrite, silent, verbose, show_time);
     if (command == INFO) return do_info(info_srcs);
+    if (command == VERIFY) return do_verify(info_srcs, verbose);
+    if (command == CHECK) return do_check(info_srcs, verbose);
     return 1;
 }

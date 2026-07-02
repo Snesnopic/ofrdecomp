@@ -12,6 +12,5 @@ research_archive/
 test.raw
 __pycache__/
 *.pyc
-CLAUDE.md
 libOptimFROG.0.dylib
 libOptimFROG.dylib

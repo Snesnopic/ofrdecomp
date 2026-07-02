@@ -24,6 +24,7 @@ add_library(optimfrogcpp_lib
     src/core/optimfrog_decoder_ent3.cpp
     src/core/optimfrog_decoder_post2.cpp
     src/core/optimfrog_encoder.cpp
+    src/core/optimfrogcpp.cpp
 )
 
 # float math that must NOT be reordered/contracted (bit-exactness vs the reference binary,

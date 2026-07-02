@@ -212,6 +212,7 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             bs->range_budget = (long)this->m_payload_len;
 
             this->range_coder.init(bs);
+            this->block_error = false;
 
             uint32_t entropy_type = uVar15 >> 11;
             uint32_t post_type = uVar15 & 0x3f;
@@ -309,6 +310,26 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
                     &this->range_coder, this->bitspersample,
                     pp->scaled_min_L, pp->scaled_max_L, pp->scaled_min_R, pp->scaled_max_R,
                     data_bits, (int)uncompressed_size);
+            } else if (pred_type == 4 && this->channels == 1) {
+                if (!this->block_decoder.predictor_dualstream_mono) {
+                    this->block_decoder.predictor_dualstream_mono = new OFR_PredictorDualStreamMono();
+                }
+                OFR_PostProcessor* pp = this->block_decoder.post_processor;
+                int mn = pp ? pp->scaled_min_L : -0x800000;
+                int mx = pp ? pp->scaled_max_L : 0x7fffff;
+                // Quantization can legitimately overshoot the source signal's exact min/max by a
+                // fraction of a step -- DualStream's own docs advertise "no clipping possible" as
+                // a design feature, unlike the lossless predictors (which by construction never
+                // exceed the true range). Widen post1's clamp bounds so it never fires here.
+                if (pp) { pp->min_val_L = -0x7fffffff; pp->max_val_L = 0x7fffffff; }
+                this->block_decoder.predictor_dualstream_mono->init(
+                    &this->range_coder, mn, mx, data_bits, (int)uncompressed_size);
+            } else if (pred_type == 4 && this->channels == 2) {
+                // DualStream (.ofs) stereo pred_type=4 is not implemented yet -- fail loudly
+                // instead of silently emitting unpredicted entropy residuals as if they were
+                // final samples.
+                this->has_recoverable_errors = true;
+                this->block_error = true;
             }
 
             // Entropy Coder
@@ -331,7 +352,6 @@ uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
             this->block_size = uncompressed_size / this->channels;
             this->block_pos = 0;
             this->need_new_block = false;
-            this->block_error = false;
 
             // Float files: the "DETA" sub-block immediately follows this COMP block's on-disk
             // payload and must be parsed sequentially right after it, so the whole block's worth

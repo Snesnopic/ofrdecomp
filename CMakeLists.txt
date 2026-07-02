@@ -24,6 +24,7 @@ add_library(optimfrogcpp_lib
     src/core/optimfrog_decoder_ent3.cpp
     src/core/optimfrog_decoder_post2.cpp
     src/core/optimfrog_decoder_float.cpp
+    src/core/optimfrog_decoder_dualstream.cpp
     src/core/optimfrog_encoder.cpp
     src/core/optimfrog_encoder_float.cpp
     src/core/optimfrogcpp.cpp
@@ -32,10 +33,10 @@ add_library(optimfrogcpp_lib
 # float math that must NOT be reordered/contracted (bit-exactness vs the reference binary,
 # which was built -fno-fast-math). pred3 cascade + the mono predictor weight-update/LDLT.
 if(MSVC)
-    set_source_files_properties(src/core/optimfrog_decoder_pred3.cpp src/core/optimfrog_decoder_predictor.cpp PROPERTIES
+    set_source_files_properties(src/core/optimfrog_decoder_pred3.cpp src/core/optimfrog_decoder_predictor.cpp src/core/optimfrog_decoder_dualstream.cpp PROPERTIES
         COMPILE_OPTIONS "/fp:precise")
 else()
-    set_source_files_properties(src/core/optimfrog_decoder_pred3.cpp src/core/optimfrog_decoder_predictor.cpp PROPERTIES
+    set_source_files_properties(src/core/optimfrog_decoder_pred3.cpp src/core/optimfrog_decoder_predictor.cpp src/core/optimfrog_decoder_dualstream.cpp PROPERTIES
         COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 endif()
 

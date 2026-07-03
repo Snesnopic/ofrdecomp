@@ -15,48 +15,64 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: Windows x64
+            os: windows-2022
+            arch: x64
+            cmake_args: -A x64
+            asset_name: ofrdecomp-windows-x64
+
+          - name: Windows ARM64
+            os: windows-2022
+            arch: arm64
+            cmake_args: -A ARM64
+            asset_name: ofrdecomp-windows-arm64
+            skip_sanity_check: true   # cross-compiled; host runner can't execute ARM64 binaries
+
+          - name: Windows x86
+            os: windows-2022
+            arch: x86
+            cmake_args: -A Win32
+            asset_name: ofrdecomp-windows-x86
+
           - name: Ubuntu x64 GCC
-            os: ubuntu-latest
+            os: ubuntu-24.04
+            arch: x64
+            compiler_c: gcc
+            compiler_cxx: g++
             asset_name: ofrdecomp-linux-x64-gcc
 
           - name: Ubuntu x64 Clang
-            os: ubuntu-latest
+            os: ubuntu-24.04
+            arch: x64
             compiler_c: clang
             compiler_cxx: clang++
             asset_name: ofrdecomp-linux-x64-clang
 
-          - name: Ubuntu x86
+          - name: Ubuntu ARM64 GCC
+            os: ubuntu-24.04-arm
+            arch: arm64
+            compiler_c: gcc
+            compiler_cxx: g++
+            asset_name: ofrdecomp-linux-arm64
+
+          - name: Ubuntu x86 GCC
             os: ubuntu-24.04
+            arch: x86
+            compiler_c: gcc
+            compiler_cxx: g++
             cmake_args: -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_C_FLAGS=-m32
             install_deps: sudo apt-get update && sudo apt-get install -y g++-multilib
             asset_name: ofrdecomp-linux-x86
 
-          - name: Ubuntu ARM64 GCC
-            os: ubuntu-24.04-arm
-            asset_name: ofrdecomp-linux-arm64
-
           - name: macOS Intel
             os: macos-15-intel
+            arch: x64
             asset_name: ofrdecomp-darwin-x64
 
           - name: macOS ARM64
             os: macos-14
+            arch: arm64
             asset_name: ofrdecomp-darwin-arm64
-
-          - name: Windows x64
-            os: windows-latest
-            asset_name: ofrdecomp-windows-x64
-
-          - name: Windows x86
-            os: windows-latest
-            cmake_args: -A Win32
-            asset_name: ofrdecomp-windows-x86
-
-          - name: Windows ARM64
-            os: windows-latest
-            cmake_args: -A ARM64
-            asset_name: ofrdecomp-windows-arm64
-            skip_sanity_check: true   # cross-compiled; host runner can't execute ARM64 binaries
 
     steps:
       - uses: actions/checkout@v7

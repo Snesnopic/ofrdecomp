@@ -25,7 +25,9 @@ static uint32_t crc32_calc_f(const uint8_t* p, size_t n) {
     for (size_t i = 0; i < n; i++) c = crc32_table_f[(c ^ p[i]) & 0xff] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
 }
-static void put32f(std::vector<uint8_t>& o, uint32_t v) { o.push_back(v); o.push_back(v>>8); o.push_back(v>>16); o.push_back(v>>24); }
+static void put32f(std::vector<uint8_t>& o, uint32_t v) {
+    o.push_back((uint8_t)v); o.push_back((uint8_t)(v>>8)); o.push_back((uint8_t)(v>>16)); o.push_back((uint8_t)(v>>24));
+}
 
 struct FloatBlockStats { int32_t minExp, maxExp; };
 

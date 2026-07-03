@@ -271,8 +271,10 @@ struct AcmEncoder {
     }
 };
 
-static void put32(std::vector<uint8_t>& o, uint32_t v) { o.push_back(v); o.push_back(v>>8); o.push_back(v>>16); o.push_back(v>>24); }
-static void put16(std::vector<uint8_t>& o, uint16_t v) { o.push_back(v); o.push_back(v>>8); }
+static void put32(std::vector<uint8_t>& o, uint32_t v) {
+    o.push_back((uint8_t)v); o.push_back((uint8_t)(v>>8)); o.push_back((uint8_t)(v>>16)); o.push_back((uint8_t)(v>>24));
+}
+static void put16(std::vector<uint8_t>& o, uint16_t v) { o.push_back((uint8_t)v); o.push_back((uint8_t)(v>>8)); }
 
 // sample_type byte for a signed PCM bit depth
 static uint8_t sample_type_for_bps(int bps) {
@@ -433,9 +435,9 @@ bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, in
     put32(file, (uint32_t)head.size());
     file.insert(file.end(), head.begin(), head.end());
     // COMP block
-    uint16_t reserved = ((uint16_t)ENT << 11) | ((uint16_t)PRED << 6) | 1u;   // ent, pred, post=1
+    uint16_t reserved = (uint16_t)(((uint16_t)ENT << 11) | ((uint16_t)PRED << 6) | 1u);   // ent, pred, post=1
     std::vector<uint8_t> payload;                       // D-4 bytes (everything after CRC field)
-    auto p32 = [&](uint32_t v){ payload.push_back(v); payload.push_back(v>>8); payload.push_back(v>>16); payload.push_back(v>>24); };
+    auto p32 = [&](uint32_t v){ payload.push_back((uint8_t)v); payload.push_back((uint8_t)(v>>8)); payload.push_back((uint8_t)(v>>16)); payload.push_back((uint8_t)(v>>24)); };
     p32(n);                                  // number of samples in block
     payload.push_back(sample_type_for_bps(bps)); // sample type
     payload.push_back(0);                    // channel config
@@ -462,8 +464,10 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
     int mnL = 0x7fffffff, mxL = -0x7fffffff-1, mnR = 0x7fffffff, mxR = -0x7fffffff-1;
     for (uint32_t i = 0; i < frames; i++) {
         int l = samples[2*i], r = samples[2*i+1];
-        if (l < mnL) mnL = l; if (l > mxL) mxL = l;
-        if (r < mnR) mnR = r; if (r > mxR) mxR = r;
+        if (l < mnL) mnL = l;
+        if (l > mxL) mxL = l;
+        if (r < mnR) mnR = r;
+        if (r > mxR) mxR = r;
     }
     if (frames == 0) { mnL = mxL = mnR = mxR = 0; }
     int mn = std::min(mnL, mnR), mx = std::max(mxL, mxR);
@@ -480,6 +484,11 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
     if (getenv("OFR_ENT")) ENT = atoi(getenv("OFR_ENT"));   // 1=fast, 2=slow
     int PRED = 1;
     if (getenv("OFR_PRED")) PRED = atoi(getenv("OFR_PRED"));   // 1=LPC, 3=cascade
+    // these come from developer-only tuning env vars (OFR_BEST's config search, manual testing),
+    // not untrusted external input -- clamp defensively anyway since a typo'd env var shouldn't
+    // read out of bounds.
+    OD_IDX = std::clamp(OD_IDX, 0, 31);
+    IV_IDX = std::clamp(IV_IDX, 0, 7);
     int max_order = DAT_00326220[OD_IDX];
     int right_order = DAT_00326200[OD_IDX];
     int interval = IVT[IV_IDX];
@@ -627,9 +636,9 @@ bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t sampler
     file.push_back('H'); file.push_back('E'); file.push_back('A'); file.push_back('D');
     put32(file, (uint32_t)head.size());
     file.insert(file.end(), head.begin(), head.end());
-    uint16_t reserved = ((uint16_t)ENT << 11) | ((uint16_t)PRED << 6) | 1u;
+    uint16_t reserved = (uint16_t)(((uint16_t)ENT << 11) | ((uint16_t)PRED << 6) | 1u);
     std::vector<uint8_t> payload;
-    auto p32 = [&](uint32_t v){ payload.push_back(v); payload.push_back(v>>8); payload.push_back(v>>16); payload.push_back(v>>24); };
+    auto p32 = [&](uint32_t v){ payload.push_back((uint8_t)v); payload.push_back((uint8_t)(v>>8)); payload.push_back((uint8_t)(v>>16)); payload.push_back((uint8_t)(v>>24)); };
     p32(values);
     payload.push_back(sample_type_for_bps(bps)); payload.push_back(1);
     payload.push_back(reserved & 0xff); payload.push_back(reserved >> 8);

@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -21,7 +23,7 @@ static void enc_one(const std::vector<int32_t>& s, uint32_t nvals, uint32_t rate
     else ofr_encode_mono(s.data(), nvals, rate, bps, out);
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     // --float: encode a raw float32 PCM file (IEEE Float / "OFRX") instead of integer PCM.
     // Consumes one positional slot less (no bps arg, always 32-bit float samples).
     bool want_float = false;
@@ -107,4 +109,13 @@ int main(int argc, char** argv) {
     fwrite(out.data(), 1, out.size(), g); fclose(g);
     fprintf(stderr, "wrote %zu bytes (ch=%d bps=%d)\n", out.size(), ch, bps);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << std::endl;
+        return 1;
+    }
 }

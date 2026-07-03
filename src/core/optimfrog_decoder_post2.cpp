@@ -125,7 +125,7 @@ void OFR_PostProcessor::init2(OFR_RangeCoder* rc, uint32_t channels, uint32_t bi
         }
     }
 
-    int mn[2], mx[2];
+    int mn[2] = {0, 0}, mx[2] = {0, 0};
     for (uint32_t ch = 0; ch < channels; ++ch) {
         if (has_remap) {
             build_inverse(A[ch], B[ch], flag[ch], present[ch], remap_tbl[ch], remap_lo[ch], mn[ch], mx[ch]);

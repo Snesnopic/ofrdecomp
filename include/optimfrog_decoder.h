@@ -23,7 +23,7 @@ public:
     // bytes left (range coder must not over-read into the next COMP block). 0 => EOF-fill with 0.
     long range_budget = -1;
 
-    OFR_BitStream(ReadInterfaceWrapper* w) : wrapper(w), buf_pos(0), buf_avail(0), total_read(0) {}
+    explicit OFR_BitStream(ReadInterfaceWrapper* w) : wrapper(w), buf_pos(0), buf_avail(0), total_read(0) {}
 
     uint8_t readByte() {
         if (range_budget == 0) return 0;
@@ -72,7 +72,7 @@ public:
         if (!wrapper->rInt->seek(wrapper->readerInstance, (sInt64_t)byte_pos)) return false;
         buf_pos = 0;
         buf_avail = 0;
-        total_read = byte_pos;
+        total_read = (uint32_t)byte_pos;
         range_budget = -1;
         return true;
     }

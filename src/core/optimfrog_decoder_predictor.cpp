@@ -184,7 +184,7 @@ void OFR_Predictor::update(double sample) {
 
     if (history_head == history_buffer.data()) {
         if (order > 0) {
-            int hist_size = history_buffer.size();
+            int hist_size = (int)history_buffer.size();
             int j = hist_size - order;
             for (int i = 0; i < order; i++) {
                 history_buffer[j++] = history_head[i];
@@ -332,7 +332,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
         if (flag == 0) {
             int left = dest[i];
             double left_pred = left_predictor.predict();
-            int left_pred_int = std::round(left_pred);
+            int left_pred_int = (int)std::round(left_pred);
             if (left_pred_int < min_val_L) left_pred_int = min_val_L;
             if (left_pred_int > max_val_L) left_pred_int = max_val_L;
             
@@ -344,7 +344,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
             if (cross_channel == 0) {
                 int right = dest[i + 1];
                 double right_pred = right_predictor.predict();
-                int right_pred_int = std::round(right_pred);
+                int right_pred_int = (int)std::round(right_pred);
                 if (right_pred_int < min_val_R) right_pred_int = min_val_R;
                 if (right_pred_int > max_val_R) right_pred_int = max_val_R;
                 
@@ -355,7 +355,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
             } else {
                 int right = dest[i + 1];
                 double right_pred = left_predictor.predict();
-                int right_pred_int = std::round(right_pred);
+                int right_pred_int = (int)std::round(right_pred);
                 if (right_pred_int < min_val_R) right_pred_int = min_val_R;
                 if (right_pred_int > max_val_R) right_pred_int = max_val_R;
                 
@@ -367,7 +367,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
         } else {
             int left = dest[i];
             double left_pred = right_predictor.predict();
-            int left_pred_int = std::round(left_pred);
+            int left_pred_int = (int)std::round(left_pred);
             if (left_pred_int < min_val_L) left_pred_int = min_val_L;
             if (left_pred_int > max_val_L) left_pred_int = max_val_L;
             
@@ -379,7 +379,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
             if (cross_channel != 0) {
                 int right = dest[i + 1];
                 double right_pred = right_predictor.predict();
-                int right_pred_int = std::round(right_pred);
+                int right_pred_int = (int)std::round(right_pred);
                 if (right_pred_int < min_val_R) right_pred_int = min_val_R;
                 if (right_pred_int > max_val_R) right_pred_int = max_val_R;
                 
@@ -390,7 +390,7 @@ void OFR_PredictorFastStereo::decode(int* dest, int count) {
             } else {
                 int right = dest[i + 1];
                 double right_pred = left_predictor.predict();
-                int right_pred_int = std::round(right_pred);
+                int right_pred_int = (int)std::round(right_pred);
                 if (right_pred_int < min_val_R) right_pred_int = min_val_R;
                 if (right_pred_int > max_val_R) right_pred_int = max_val_R;
                 
@@ -592,7 +592,7 @@ void OFR_PredictorStereo::decode(int32_t* outputs, uint32_t num_samples) {
     }
 }
 
-bool OFR_SolveLDLT(double* matrix, double* rhs_out, double* diagonal, int size) {
+static bool OFR_SolveLDLT(double* matrix, double* rhs_out, double* diagonal, int size) {
     uint64_t abs_mask = 0x7FFFFFFFFFFFFFFF;
     double d_val = matrix[0];
     diagonal[0] = d_val;

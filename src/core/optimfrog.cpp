@@ -111,7 +111,7 @@ static condition_t file_close(void* instance) {
 
 static sInt32_t file_read(void* instance, void* buffer, uInt32_t size) {
     FileWrapper* fw = (FileWrapper*)instance;
-    return fread(buffer, 1, size, fw->file);
+    return (sInt32_t)fread(buffer, 1, size, fw->file);
 }
 
 static condition_t file_eof(void* instance) {
@@ -280,14 +280,14 @@ sInt32_t OptimFROG_read(void* decoderInstance, void* data, uInt32_t noPoints, co
     int* temp_buffer = (int*)malloc(samples_to_read * sizeof(int));
     if (!temp_buffer) return -1;
     
-    uInt32_t points_read = pInt->read(temp_buffer, points_to_read);
+    uInt32_t points_read = pInt->read(temp_buffer, (uInt32_t)points_to_read);
     uInt32_t samples_read = points_read * pInt->channels;
     
     int stype = pInt->sample_type;
     
     if (stype == 0 || stype == 1) { // 8 bit
         for (sInt64_t i = 0; i < samples_read; ++i) {
-            ((uint8_t*)data)[i] = (stype == 0 ? 0x80 : 0) + temp_buffer[i];
+            ((uint8_t*)data)[i] = (uint8_t)((stype == 0 ? 0x80 : 0) + temp_buffer[i]);
         }
     } else if (stype == 2 || stype == 3) { // 16 bit
         int offset = (stype == 2) ? 0x8000 : 0;
@@ -414,7 +414,7 @@ sInt32_t OptimFROG_decodeFile(char* sourceFile, char* destinationFile, OptimFROG
         return OptimFROG_OpenError;
     }
     
-    OptimFROG_Info info;
+    OptimFROG_Info info{};
     OptimFROG_getInfo(decoderInstance, &info);
     
     FILE* outFile = fopen(destinationFile, "wb");

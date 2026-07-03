@@ -2,13 +2,12 @@
 #include <vector>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include "OptimFROG.h"
 
-int main(int argc, char** argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
+static int run(int argc, char** argv) {
     std::cout << "OptimFROGcpp Decoder v" << OptimFROG_getVersion() << std::endl;
-    
+
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <input.ofr>" << std::endl;
         return 1;
@@ -53,4 +52,15 @@ int main(int argc, char** argv) {
     
     OptimFROG_destroyInstance(instance);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << std::endl;
+        return 1;
+    }
 }

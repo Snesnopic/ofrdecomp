@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <exception>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -216,7 +217,8 @@ PresetConfig preset_config(const std::string& preset, int channels) {
 
     static const int mono_orders[] = {24, 24, 64, 64, 96, 96, 96, 96, 96, 96, 96};
     static const int od_idxs[]     = { 0,  0,  0,  1,  1,  1,  1,  1,  1,  1,  1};
-    if (level < 0) level = 0; if (level > 10) level = 10;
+    if (level < 0) level = 0;
+    if (level > 10) level = 10;
 
     PresetConfig c;
     c.mono_order = mono_orders[level];
@@ -449,7 +451,7 @@ int do_info(const std::vector<std::string>& srcs) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     if (argc < 2) { print_help(); return 1; }
 
     enum { NONE, ENCODE, DECODE, INFO, VERIFY, CHECK, HELP } command = NONE;
@@ -506,4 +508,13 @@ int main(int argc, char** argv) {
     if (command == VERIFY) return do_verify(info_srcs, verbose);
     if (command == CHECK) return do_check(info_srcs, verbose);
     return 1;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Fatal error: %s\n", e.what());
+        return 1;
+    }
 }

@@ -6,6 +6,8 @@
 
 namespace optimfrogcpp {
 
+DecodeError::~DecodeError() = default;
+
 Decoder::Decoder(const std::string& path) {
     instance_ = OptimFROG_createInstance();
     if (!instance_) throw DecodeError("OptimFROG_createInstance failed", OptimFROG_MemoryError);

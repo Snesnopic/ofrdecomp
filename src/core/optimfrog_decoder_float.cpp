@@ -12,31 +12,30 @@
 //     zero-sentinel's sign, two raw 12-bit chunks for inf/nan's sign+mantissa).
 #include "../../include/optimfrog_decoder.h"
 
-void OFR_DecoderEngine::reconstruct_float_block(int32_t* buf, uint32_t count) {
-    OFR_BitStream* bs = this->bitstream;
+// exponents below the normal range are subnormals, still carried with a normalized mantissa:
+// the implicit bit has to be shifted back into the stored fraction.
+static uint32_t assemble_float(int32_t exp_i, uint32_t fraction) {
+    if (exp_i >= -126) return ((uint32_t)(exp_i + 127) << 23) | fraction;
+    int32_t shift = -126 - exp_i;
+    return shift < 24 ? (0x800000u | fraction) >> shift : 0u;
+}
 
-    uint32_t deta_magic = bs->readU32();
-    if (deta_magic != 0x41544544) { // "DETA"
-        this->has_recoverable_errors = true;
-        return;
-    }
-    uint32_t len = bs->readU32();
-    bs->readU32(); // crc32, not verified here
-    uint32_t payload_len = (len >= 4) ? (len - 4) : 0;
-    uint32_t payload_start = bs->tell();
+void OFR_FloatBlock::init(std::vector<uint8_t>&& payload) {
+    payload_ = std::move(payload);
+    rc_.init(payload_.data(), payload_.size());
 
-    bs->range_budget = (long)payload_len;
-    OFR_RangeCoder rc;
-    rc.init(bs);
+    exp_range_ = (int32_t)rc_.decode_uniform(256);
+    sig_shift_ = (int32_t)rc_.decode_uniform(256);
+    min_exp_ = (int32_t)rc_.decode_uniform(512) - 150;
+    max_exp_ = (int32_t)rc_.decode_uniform(512) - 150;
 
-    int32_t iVar3 = (int32_t)rc.decode_uniform(256);
-    int32_t sigShift = (int32_t)rc.decode_uniform(256);
-    int32_t local_60 = (int32_t)rc.decode_uniform(512) - 150;
-    int32_t local_74 = (int32_t)rc.decode_uniform(512) - 150;
+    ctx2_.init(2, 0x8000);
+    ctx279_.init(0x117, 0x8000);
+}
 
-    OFR_ModelContext ctx2, ctx279;
-    ctx2.init(2, 0x8000);
-    ctx279.init(0x117, 0x8000);
+void OFR_FloatBlock::reconstruct(int32_t* buf, uint32_t count) {
+    OFR_RangeCoder& rc = rc_;
+    const int32_t cap = 23 - sig_shift_;
 
     for (uint32_t i = 0; i < count; i++) {
         int32_t v = buf[i];
@@ -44,13 +43,13 @@ void OFR_DecoderEngine::reconstruct_float_block(int32_t* buf, uint32_t count) {
 
         if (v != 0) {
             // fast path
-            uint32_t mag = (uint32_t)(v < 0 ? -v : v);
+            uint32_t mag = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
             int L = 31;
             while (!((mag >> L) & 1)) L--; // bit length - 1 (mag != 0, guaranteed)
-            int32_t exp_i = L - iVar3 + local_74;
+            if (L > 23) throw OFR_StreamError("float mantissa too wide");
+            int32_t exp_i = L - exp_range_ + max_exp_;
 
-            int32_t bits_avail = exp_i - local_60;
-            int32_t cap = 23 - sigShift;
+            int32_t bits_avail = exp_i - min_exp_;
             if (cap < bits_avail) bits_avail = cap;
             if (bits_avail < 0) bits_avail = 0;
             int32_t residual_bits = bits_avail - L;
@@ -61,15 +60,14 @@ void OFR_DecoderEngine::reconstruct_float_block(int32_t* buf, uint32_t count) {
                 fraction |= (extra << (23 - bits_avail));
             }
 
-            uint32_t biased_exp = (uint32_t)(exp_i + 127);
-            bits = (biased_exp << 23) | fraction;
+            bits = assemble_float(exp_i, fraction);
             if (v < 0) bits |= 0x80000000u;
         } else {
             // escape path
-            uint32_t sym = rc.decode_symbol(ctx279);
+            uint32_t sym = rc.decode_symbol(ctx279_);
             if (sym == 0) {
                 // true zero / extreme denormal underflow -> reconstruct as signed zero
-                uint32_t signSym = rc.decode_symbol(ctx2);
+                uint32_t signSym = rc.decode_symbol(ctx2_);
                 bits = signSym ? 0x80000000u : 0u;
             } else if (sym == 0x116) {
                 // inf/nan
@@ -84,8 +82,7 @@ void OFR_DecoderEngine::reconstruct_float_block(int32_t* buf, uint32_t count) {
                 int32_t exp_i = (int32_t)sym - 150;
                 bool negative = rc.decode_uniform(2) != 0;
 
-                int32_t bits_avail = exp_i - local_60;
-                int32_t cap = 23 - sigShift;
+                int32_t bits_avail = exp_i - min_exp_;
                 if (cap < bits_avail) bits_avail = cap;
                 if (bits_avail < 0) bits_avail = 0;
 
@@ -94,16 +91,11 @@ void OFR_DecoderEngine::reconstruct_float_block(int32_t* buf, uint32_t count) {
                     fraction = rc.read_uniform_split((uint32_t)bits_avail) << (23 - bits_avail);
                 }
 
-                uint32_t biased_exp = (uint32_t)(exp_i + 127);
-                bits = (biased_exp << 23) | fraction;
+                bits = assemble_float(exp_i, fraction);
                 if (negative) bits |= 0x80000000u;
             }
         }
 
         buf[i] = (int32_t)bits;
     }
-
-    bs->range_budget = -1;
-    uint32_t consumed = bs->tell() - payload_start;
-    for (uint32_t k = consumed; k < payload_len; ++k) bs->readU8();
 }

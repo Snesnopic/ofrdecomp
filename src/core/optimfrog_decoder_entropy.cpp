@@ -1,12 +1,7 @@
-// Entropy decoder – rewritten from Ghidra decompilation of FUN_00109ab0.
-// See comments in implementation_plan.md for the full analysis.
+// entropy decoders: ent=1 (fast, FUN_00004710) and ent=2 (slow, FUN_00109ab0).
 
-#include "optimfrog_decoder.h"
+#include "../../include/optimfrog_decoder.h"
 #include <cstring>
-#include <iostream>
-#include <cassert>
-#include <cstdio>
-#include <cstdlib>
 
 // ============================================================
 // OFR_ModelContext  (mirrors binary's "segment tree" context)
@@ -55,30 +50,10 @@ uint32_t OFR_ModelContext::rebuild_tree(uint32_t node) {
 
 // ============================================================
 
-void OFR_EntropyDecoder::init(uint32_t depth, uint32_t ch, uint32_t entropy_type, bool fast_stereo) {
+void OFR_EntropyDecoder::init(uint32_t depth, uint32_t ch, uint32_t entropy_type) {
     this->bit_depth = depth;
     this->channels = ch;
     this->type = entropy_type;
-    this->is_fast_stereo = fast_stereo;
-}
-
-// Rebuild internal nodes for the master context (same logic as OFR_ModelContext)
-uint32_t OFR_EntropyDecoder::rebuild_master(uint32_t node) {
-    if (master_num_nodes <= node) return (uint32_t)master_freqs[node];
-    uint32_t left  = rebuild_master(node * 2);
-    uint32_t right = rebuild_master(node * 2 + 1);
-    master_freqs[node] = (int32_t)left;
-    return left + right;
-}
-
-void OFR_EntropyDecoder::halve_master() {
-    master_total_freq = 0;
-    for (uint32_t i = 0; i < master_num_symbols; ++i) {
-        uint32_t& f = master_freqs[master_num_nodes + i];
-        f = (((f - 1) >> 1) + 1u);
-        master_total_freq += f;
-    }
-    rebuild_master(1);
 }
 
 // FUN_00004220 — called once per block.
@@ -88,26 +63,8 @@ void OFR_EntropyDecoder::init_from_bitstream(OFR_RangeCoder* rc) {
     uint32_t w = rc->read_12bit_value();
     weight  = (double)(w - 1) / (double)w;
     weight2 = 1.0 - weight;   // binary derives weight2 from weight (1-ULP off vs 1/w)
-    decoded_samples = 0;
     needs_init = true;
 }
-
-// ============================================================
-// range-coder helpers  (exact transcription of normalize loop)
-// ============================================================
-// The binary's normalise loop (e.g. lines 28-54 of FUN_00109ab0):
-//   while (range < 0x800001):
-//     value = (cache_bit<<7 | value<<8)
-//     cache_bit = next_byte & 0xff
-//     value |= cache_bit >> 1
-//     range <<= 8
-
-// Our OFR_RangeCoder::normalize() must match this exactly.
-// From include/optimfrog_decoder.h the struct is:
-//   uint32_t value, range;
-//   uint8_t  cache;
-//   void*    bs_ptr;
-// We'll use our existing normalize() implementation.
 
 // ============================================================
 // Tree-walk decode (used in both fast and slow path)
@@ -218,8 +175,7 @@ static inline uint32_t decode_abs_bits(uint32_t nbits, OFR_RangeCoder* rc) {
 int32_t OFR_EntropyDecoder::decode_one_sample(double& var, OFR_RangeCoder* rc) {
     uint32_t raw_val = 0;
     int sym2 = -1;
-    // The binary uses CVTTSD2SI to cast the double to an int64_t
-    int64_t var_int = (int64_t)var;
+    int64_t var_int = trunc_to_int64_cvttsd2si(var);
     uint32_t uVar6 = ((uint32_t)var_int >> 2) & 0x3fffffffu;
     uint32_t uVar16 = uVar6 + 1u;
 
@@ -293,13 +249,7 @@ decode_escape:
 
         uint32_t new_bits = (uint32_t)iVar14d;
 
-        // Validate (line 169 / 542)
-        if (new_bits >= bit_depth) {
-            std::cerr << "ERROR: escape new_bits=" << new_bits
-                      << " >= bit_depth=" << bit_depth << "\n";
-            raw_val = 0;
-            goto emit;
-        }
+        if (new_bits >= bit_depth) throw OFR_StreamError("entropy escape exceeds the bit depth");
 
         uint32_t remaining = bit_depth - new_bits;
 
@@ -351,7 +301,7 @@ static uint32_t fast_rebuild(std::vector<uint32_t>& f, uint32_t node, uint32_t n
 }
 
 // FUN_00002bd0: init one context with num_symbols leaves
-static void fast_ctx_init(OFR_EntropyDecoder::FastCtx& c, uint32_t num_symbols, uint32_t limit) {
+void OFR_EntropyDecoder::fast_ctx_init(FastCtx& c, uint32_t num_symbols, uint32_t limit) {
     c.num_symbols = num_symbols;
     uint32_t nn = 1;
     while (nn < num_symbols) nn <<= 1;
@@ -364,7 +314,7 @@ static void fast_ctx_init(OFR_EntropyDecoder::FastCtx& c, uint32_t num_symbols, 
 }
 
 // FUN_00002df0: halve leaf frequencies and rebuild
-static void fast_ctx_halve(OFR_EntropyDecoder::FastCtx& c) {
+void OFR_EntropyDecoder::fast_ctx_halve(FastCtx& c) {
     c.total_freq = 0;
     for (uint32_t i = 0; i < c.num_symbols; ++i) {
         uint32_t& f = c.freqs[c.num_nodes + i];
@@ -379,6 +329,7 @@ int32_t OFR_EntropyDecoder::fast_decode_sample(double& var, OFR_RangeCoder* rc) 
     uint64_t vbits;
     std::memcpy(&vbits, &var, 8);
     uint32_t idx = (uint32_t)((vbits >> 52) + 0xfffffc01u);   // unbiased exponent
+    if (idx >= fast_contexts.size()) throw OFR_StreamError("entropy variance out of range");
     FastCtx& c = fast_contexts[idx];
     auto& f = c.freqs;
 
@@ -427,8 +378,8 @@ int32_t OFR_EntropyDecoder::fast_decode_sample(double& var, OFR_RangeCoder* rc) 
 // ============================================================
 // decode_block
 // ============================================================
-int32_t OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_RangeCoder* rc) {
-    if (type == 1) {   // fast entropy (FUN_00004710), 1 or 2 channels
+void OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_RangeCoder* rc) {
+    if (type == 1) {
         if (needs_init) {
             uint32_t num_contexts = bit_depth * 2u;
             uint32_t per_symbols = (bit_depth < 4u) ? (1u << bit_depth) : (bit_depth * 8u - 0x10u);
@@ -448,71 +399,10 @@ int32_t OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_Rang
             for (uint32_t i = 0; i < count; ++i)
                 dest[i] = fast_decode_sample(fast_var_L, rc);
         }
-        decoded_samples += count;
-        return 1;
+        return;
     }
-    // The binary's FUN_00109470/FUN_00109530 checks *(param_1+0x4c) (needs_init).
-    // If set:
-    //   1. FUN_00105c60(param_1+0x30, 0x20, 0x8000) = reinit master context
-    //   2. *(param_1+0x18) = 0  = reset variance to 0.0
-    //   3. *(param_1+0x4c) = 0  = clear needs_init
-    // Then the first FUN_00109ab0 call checks *(param_1+0x48) == 0
-    //   (needs_weight_init). If so, calls FUN_00106eb0(param_1, rc):
-    //     reads 12-bit val, computes weight = (val-1)/val, weight2 = 1.0/val
-    //     sets *(param_1+0x48) = 0 (cleared)
-    //     sets *(param_1+0x4c) = 1 (set)... wait this would loop?
-    //
-    // Actually looking at FUN_00109ab0 more carefully:
-    // Line 26 of FUN_0010a9b0 (different from FUN_00109ab0):
-    //   uVar5 = *(uint *)(param_1 + 0x3c);  <- num_symbols, not a "needs_init" check
-    // The real init check is in FUN_00109470 at top:
-    //   if (*(char*)(param_1+0x4c) != '\0') {
-    //     FUN_00105c60(param_1+0x30, 0x20, 0x8000);
-    //     *(uint*)(param_1+0x18) = 0;
-    //     *(char*)(param_1+0x4c) = 0;
-    //   }
-    // FUN_00106eb0 is called via vtable BEFORE FUN_00109ab0:
-    //   Looking at FUN_00109470 again - it doesn't call FUN_00106eb0.
-    //   FUN_00106eb0 is a DIFFERENT function that comes from vtable[1] at 003255f0
-    //   and 0x106eb0 is listed there. It's the "init" method of a different class.
-    //
-    // Looking at what actually calls decode_block (FUN_00109470):
-    // FUN_00109470 is called from FUN_00116060 (OFR_Block_decode) line:
-    //   (**(code **)(*(long *)param_1[1] + 8))((long *)param_1[1], param_2, uVar2, param_1+3);
-    // That's vtable[1]. For the entropy object (param_1[0xe] in init_decoders),
-    // it has vtable = 003255f0, vtable[1] = 0x001075c0??? No wait...
-    //
-    // param_1[0xe] is init by FUN_00109460 which calls FUN_00109430:
-    //   FUN_00109430(param_1) → *param_1 = &PTR_FUN_003255f0
-    // So vtable = 003255f0:
-    //   [0] = 0x106eb0 (decode_block with weight init)
-    //   [1] = 0x107590 (the actual decode... wait)
-    //   Wait: vtable[1] in FUN_001075c0 chain is for the STEREO fast object!
-    //
-    // For param_1[0xe] (stereo simple), vtable = 003255f0:
-    //   vtable[0] = FUN_00106eb0  (init, reads weight from bitstream)
-    //   vtable[1] = FUN_001097b0  (destructor?)
-    // No that can't be right either.
-    //
-    // FUN_00116060 calls (*vtable[1])(entropy, output_buf, count, predictor_ptr)
-    // For the entropy at param_1[0xe] (init by FUN_00109460/FUN_00109430):
-    //   vtable = 003255f0
-    //   vtable[1] = 0x001070b0???
-    //
-    // Let me check: 003255f0[0] = 0x106eb0, 003255f0[1] = 0x107590?
-    // From our earlier read: 003255f0 = [b06e1000...] [b070 3200...]
-    //   = 0x106eb0 and 0x3270b0???
-    // Actually from the read: hex b06e100000000000 = little-endian 0x00106eb0
-    //                              b070320000000000 = 0x003270b0 (different!)
-    // So vtable[1] = 0x003270b0 which is a data section address, not a function.
-    // This suggests the vtable is only 1 entry? No, there's likely RTTI before.
-    //
-    // OK I'm going in circles. Let me take a completely different approach:
-    // FORGET the init machinery. Just:
-    //   1. On first call: read weight from range coder (FUN_00106eb0 logic)
-    
+
     if (needs_init) {
-        // Init master context (FUN_00105c60(param_1+0x30, 0x20, 0x8000))
         master_num_symbols = 32u;
         master_limit       = 0x8000u;
         master_num_nodes   = 32u;
@@ -520,20 +410,14 @@ int32_t OFR_EntropyDecoder::decode_block(int32_t* dest, uint32_t count, OFR_Rang
         for (uint32_t i = 0; i < master_num_symbols; ++i)
             master_freqs[master_num_nodes + i] = 1;
         master_total_freq = init_tree_recursive(master_freqs, 1, master_num_symbols);
-
-        // Reset variance to 0.0 (*(param_1+0x18) = 0)
         variance  = 0.0;
         variance2 = 0.0;
-
-
         needs_init = false;
     }
 
     for (uint32_t i = 0; i < count; ++i) {
-        // Stereo interleaving: even=L uses variance, odd=R uses variance2
+        // stereo interleaving: even values use the left variance, odd ones the right
         double& var = (channels == 2 && (i & 1)) ? variance2 : variance;
         dest[i] = decode_one_sample(var, rc);
     }
-    decoded_samples += count;
-    return 1;
 }

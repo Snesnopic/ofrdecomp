@@ -1,28 +1,35 @@
-/* Copyright (C) 1996-2016 Florin Ghido, all rights reserved. */
-/* OptimFROG SDK v1.600 for OptimFROG Lossless/DualStream Audio Codec */
-/* Visit http://LosslessAudio.org/ for updates and more information. */
-/* @OptimFROG is also on Twitter. E-mail: florin.ghido@gmail.com */
-/* SDK and Libraries are free for non-commercial and commercial use. */
-
-
-/* OptimFROG.h contains a C/C++ interface to DLL/SO/DYLIB Libraries for */
-/* working with OptimFROG Lossless (OFR) and DualStream (OFS) files. */
-
+/* C decoding API of ofrdecomp, source compatible with the interface of the official OptimFROG
+   library so that existing callers can link against this implementation instead.
+   Part of ofrdecomp, MIT licensed, see LICENSE. */
 
 #ifndef OPTIMFROG_H_INCLUDED
 #define OPTIMFROG_H_INCLUDED
 
+#include <stddef.h>
+#include <stdint.h>
 
-#include "PortableTypes.h"
+typedef int8_t sInt8_t;
+typedef uint8_t uInt8_t;
+typedef int16_t sInt16_t;
+typedef uint16_t uInt16_t;
+typedef int32_t sInt32_t;
+typedef uint32_t uInt32_t;
+typedef int64_t sInt64_t;
+typedef uint64_t uInt64_t;
+typedef float Float32_t;
+typedef double Float64_t;
 
+typedef unsigned char condition_t;
+#define C_TRUE 1
+#define C_FALSE 0
+#define C_NULL NULL
 
-#if defined(CFG_MSCVER_WIN32_MIX86) || defined(CFG_BORLANDC_WIN32_MIX86) || defined(CFG_MSCVER_WIN64_MX64)
+/* byte packed, as in the official library */
 #pragma pack(push, 1)
-#endif
 
-
-typedef struct
-{
+/* user supplied reader. close is called exactly once, when the decoder is done with the reader
+   or fails to open it. */
+typedef struct {
     condition_t (*close)(void* instance);
     sInt32_t (*read)(void* instance, void* destBuffer, uInt32_t count);
     condition_t (*eof)(void* instance);
@@ -30,27 +37,15 @@ typedef struct
     sInt64_t (*length)(void* instance);
     sInt64_t (*getPos)(void* instance);
     condition_t (*seek)(void* instance, sInt64_t pos);
-}
-#if defined(CFG_ATTRIBUTE_PACKED)
-__attribute__((packed))
-#endif
-ReadInterface;
+} ReadInterface;
 
-
-typedef struct
-{
+typedef struct {
     uInt32_t keyCount;
     char* keys[64];
     char* values[64];
-}
-#if defined(CFG_ATTRIBUTE_PACKED)
-__attribute__((packed))
-#endif
-OptimFROG_Tags;
+} OptimFROG_Tags;
 
-
-typedef struct
-{
+typedef struct {
     uInt32_t channels;
     uInt32_t samplerate;
     uInt32_t bitspersample;
@@ -67,72 +62,59 @@ typedef struct
 
     const char* sampleType;
     const char* channelConfig;
-}
-#if defined(CFG_ATTRIBUTE_PACKED)
-__attribute__((packed))
-#endif
-OptimFROG_Info;
+} OptimFROG_Info;
 
-
-#if defined(CFG_MSCVER_WIN32_MIX86) || defined(CFG_BORLANDC_WIN32_MIX86) || defined(CFG_MSCVER_WIN64_MX64)
 #pragma pack(pop)
-#endif
-
 
 typedef void (*OptimFROG_callBack)(void* callBackParam, Float64_t percentage);
 
-
-#ifndef IMPORT_SYMBOL
-#if defined(CFG_MSCVER_WIN32_MIX86) || defined(CFG_BORLANDC_WIN32_MIX86) || defined(CFG_GNUC_MINGW32_I386) || defined(CFG_GNUC_CYGWIN_I386) || defined(CFG_MSCVER_WIN64_MX64)
-#define IMPORT_SYMBOL __declspec(dllimport)
-#else
-#define IMPORT_SYMBOL
-#endif
-#endif
-
-
 #if defined(__cplusplus)
-extern "C"
-{
-#define DEFAULT_FALSE = C_FALSE
-#define DEFAULT_NULL = C_NULL
+extern "C" {
+#define OFR_DEFAULT_FALSE = C_FALSE
+#define OFR_DEFAULT_NULL = C_NULL
 #else
-#define DEFAULT_FALSE
-#define DEFAULT_NULL
+#define OFR_DEFAULT_FALSE
+#define OFR_DEFAULT_NULL
 #endif
 
-IMPORT_SYMBOL uInt32_t OptimFROG_getVersion(void);
+uInt32_t OptimFROG_getVersion(void);
 
-IMPORT_SYMBOL void* OptimFROG_createInstance(void);
-IMPORT_SYMBOL void OptimFROG_destroyInstance(void* decoderInstance);
+void* OptimFROG_createInstance(void);
+void OptimFROG_destroyInstance(void* decoderInstance);
 
-IMPORT_SYMBOL condition_t OptimFROG_openExt(void* decoderInstance, ReadInterface* rInt, void* readerInstance, condition_t readTags DEFAULT_FALSE);
+/* both return C_TRUE on success */
+condition_t OptimFROG_openExt(void* decoderInstance, ReadInterface* rInt, void* readerInstance, condition_t readTags OFR_DEFAULT_FALSE);
+condition_t OptimFROG_open(void* decoderInstance, const char* fileName, condition_t readTags OFR_DEFAULT_FALSE);
+condition_t OptimFROG_close(void* decoderInstance);
 
-IMPORT_SYMBOL condition_t OptimFROG_open(void* decoderInstance, char* fileName, condition_t readTags DEFAULT_FALSE);
-IMPORT_SYMBOL condition_t OptimFROG_close(void* decoderInstance);
+/* copy the opaque bytes stored around the audio. the return value is the stored size: when it
+   exceeds maxSize nothing is copied, so a first call with maxSize 0 queries the size.
+   OptimFROG_readTail returns -1 until every point has been read. */
+sInt32_t OptimFROG_readHead(void* decoderInstance, void* headData, uInt32_t maxSize);
+sInt32_t OptimFROG_readTail(void* decoderInstance, void* tailData, uInt32_t maxSize);
 
-IMPORT_SYMBOL sInt32_t OptimFROG_readHead(void* decoderInstance, void* headData, uInt32_t maxSize);
-IMPORT_SYMBOL sInt32_t OptimFROG_readTail(void* decoderInstance, void* tailData, uInt32_t maxSize);
+condition_t OptimFROG_seekable(void* decoderInstance);
+condition_t OptimFROG_seekPoint(void* decoderInstance, sInt64_t point);
+condition_t OptimFROG_seekTime(void* decoderInstance, sInt64_t milliseconds);
+sInt64_t OptimFROG_getPos(void* decoderInstance);
+condition_t OptimFROG_recoverableErrors(void* decoderInstance);
 
-IMPORT_SYMBOL condition_t OptimFROG_seekable(void* decoderInstance);
-IMPORT_SYMBOL condition_t OptimFROG_seekPoint(void* decoderInstance, sInt64_t point);
-IMPORT_SYMBOL condition_t OptimFROG_seekTime(void* decoderInstance, sInt64_t milliseconds);
-IMPORT_SYMBOL sInt64_t OptimFROG_getPos(void* decoderInstance);
-IMPORT_SYMBOL condition_t OptimFROG_recoverableErrors(void* decoderInstance);
+/* a point is one sample per channel. returns the points read, 0 at end of stream, -1 on error.
+   data receives the native sample format, bitspersample/8 bytes per value, or 16-bit values for
+   wider formats when max16bit is set. */
+sInt32_t OptimFROG_read(void* decoderInstance, void* data, uInt32_t noPoints, condition_t max16bit OFR_DEFAULT_FALSE);
 
-IMPORT_SYMBOL sInt32_t OptimFROG_read(void* decoderInstance, void* data, uInt32_t noPoints, condition_t max16bit DEFAULT_FALSE);
+condition_t OptimFROG_getInfo(void* decoderInstance, OptimFROG_Info* info);
+condition_t OptimFROG_getTags(void* decoderInstance, OptimFROG_Tags* tags);
+void OptimFROG_freeTags(OptimFROG_Tags* tags);
 
-IMPORT_SYMBOL condition_t OptimFROG_getInfo(void* decoderInstance, OptimFROG_Info* info);
-IMPORT_SYMBOL condition_t OptimFROG_getTags(void* decoderInstance, OptimFROG_Tags* tags);
-IMPORT_SYMBOL void OptimFROG_freeTags(OptimFROG_Tags* tags);
-
-IMPORT_SYMBOL sInt32_t OptimFROG_decodeFile(char* sourceFile, char* destinationFile, OptimFROG_callBack callBack DEFAULT_NULL, void* callBackParam DEFAULT_NULL);
-IMPORT_SYMBOL sInt32_t OptimFROG_infoFile(char* sourceFile, OptimFROG_Info* info, OptimFROG_Tags* tags DEFAULT_NULL);
+/* return one of the result codes below */
+sInt32_t OptimFROG_decodeFile(const char* sourceFile, const char* destinationFile, OptimFROG_callBack callBack OFR_DEFAULT_NULL, void* callBackParam OFR_DEFAULT_NULL);
+sInt32_t OptimFROG_infoFile(const char* sourceFile, OptimFROG_Info* info, OptimFROG_Tags* tags OFR_DEFAULT_NULL);
 
 #if defined(__cplusplus)
 }
 #endif
-
 
 #define OptimFROG_NoError 0
 #define OptimFROG_MemoryError 1
@@ -140,6 +122,5 @@ IMPORT_SYMBOL sInt32_t OptimFROG_infoFile(char* sourceFile, OptimFROG_Info* info
 #define OptimFROG_WriteError 3
 #define OptimFROG_FatalError 4
 #define OptimFROG_RecoverableError 5
-
 
 #endif

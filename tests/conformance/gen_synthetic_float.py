@@ -15,6 +15,22 @@ def write(name, gen, ch, n):
                 buf += struct.pack('<f', gen(i, c))
         f.write(buf)
 
+# same, from raw bit patterns: struct would quietly change a signalling NaN
+def write_bits(name, gen, ch, n):
+    path = os.path.join(outdir, f"{name}__{ch}ch__float32.raw")
+    with open(path, 'wb') as f:
+        buf = bytearray()
+        for i in range(n):
+            for c in range(ch):
+                buf += struct.pack('<I', gen(i, c))
+        f.write(buf)
+
+def bits_of(x):
+    return struct.unpack('<I', struct.pack('<f', x))[0]
+
+SPECIALS = [0x00000000, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0x7fc00001, 0xffc00123, 0x7f800001,
+            0x00000001, 0x80000001, 0x00000002, 0x007fffff, 0x807fffff, 0x00400000, 0x00800000, 0x7f7fffff]
+
 random.seed(5678)
 N = 4000
 
@@ -35,5 +51,10 @@ for ch in (1, 2):
     write("chirp",      lambda i,c: 0.7*math.sin(i*i*1e-5 + c), ch, N)
     write("mixedmag",   lambda i,c: (10.0**random.randint(-30,10)) * random.choice([-1,1]) * random.uniform(0.1,1.0), ch, N)
     write("decay",      lambda i,c: 0.9*math.sin(i*0.05)*math.exp(-i/1000.0), ch, N)
+    write_bits("subnormal",  lambda i,c: random.getrandbits(1) << 31 | random.randrange(1, 1 << 23), ch, N)
+    write_bits("subnormlow", lambda i,c: random.randrange(1, 64), ch, N)
+    write_bits("subnormmix", lambda i,c: random.randrange(1, 1 << 23) if i % 7 == 0 else bits_of(0.5*math.sin(i*0.05 + c)), ch, N)
+    write_bits("specials",   lambda i,c: SPECIALS[i % 16] if i % 5 == 0 else bits_of(0.5*math.sin(i*0.05 + c)), ch, N)
+    write_bits("onlyspecial", lambda i,c: SPECIALS[(i + c) % 16], ch, N)
 
-print(f"{2 * 15} files written to {outdir}")
+print(f"{2 * 21} files written to {outdir}")

@@ -42,15 +42,22 @@ uint32_t read32(OFR_RangeCoder* rc) {  // FUN_00016bf0: 4 bytes, little-endian
 }
 int32_t sext(uint32_t v, uint32_t bits) { uint32_t s=32-bits; return ((int32_t)(v<<s))>>s; }
 
+// a remap table spans the whole value range of a channel: full 24-bit is fine, a corrupt header
+// claiming the whole 32-bit range is not worth gigabytes of memory
+constexpr int64_t MAX_REMAP_RANGE = (int64_t)1 << 28;
+void check_remap_range(int a, int b) {
+    if (b < a || (int64_t)b - a >= MAX_REMAP_RANGE) throw OFR_StreamError("invalid value remap range");
+}
+
 int xform(int idx, double scale, int v) {
     double sv = (double)v * scale;
     switch (idx) {
-        case 1: return (int)std::ceil(sv);
-        case 2: return v < 0 ? (int)std::ceil(sv) : (int)std::floor(sv);
-        case 3: return v < 0 ? (int)std::floor(sv) : (int)std::ceil(sv);
-        case 4: return (int)std::floor(sv + 0.5);
-        case 5: return (int)std::lrint(sv);
-        default: return (int)std::floor(sv);   // 0, 6
+        case 1: return trunc_to_int32_cvttsd2si(std::ceil(sv));
+        case 2: return trunc_to_int32_cvttsd2si(v < 0 ? std::ceil(sv) : std::floor(sv));
+        case 3: return trunc_to_int32_cvttsd2si(v < 0 ? std::floor(sv) : std::ceil(sv));
+        case 4: return trunc_to_int32_cvttsd2si(std::floor(sv + 0.5));
+        case 5: return round_to_int32_cvtsd2si(sv);
+        default: return trunc_to_int32_cvttsd2si(std::floor(sv));   // 0, 6
     }
 }
 
@@ -58,13 +65,13 @@ int xform(int idx, double scale, int v) {
 void build_present(OFR_RangeCoder* rc, int A, int B, int tidx, double scale, std::vector<uint8_t>& present) {
     int n = B - A + 1;
     std::vector<uint8_t> cand(n, 0);
-    for (int v = A; v <= B; ++v) { int c = xform(tidx, scale, v); if (c >= A && c <= B) cand[c-A] = 1; }
+    for (int v = A; ; ++v) { int c = xform(tidx, scale, v); if (c >= A && c <= B) cand[c-A] = 1; if (v == B) break; }
     present.assign(n, 0);
     PCtx c0,c1,c2,c3; pctx_init(c0,2,0x8000); pctx_init(c1,2,0x8000); pctx_init(c2,2,0x8000); pctx_init(c3,3,0x8000);
-    auto gp = [&](int v){ return (v>=A && v<=B) ? present[v-A] : (uint8_t)0; };
-    auto gc = [&](int v){ return (v>=A && v<=B) ? cand[v-A] : (uint8_t)0; };
+    auto gp = [&](int64_t v){ return (v>=A && v<=B) ? present[(size_t)(v-A)] : (uint8_t)0; };
+    auto gc = [&](int64_t v){ return (v>=A && v<=B) ? cand[(size_t)(v-A)] : (uint8_t)0; };
     for (int v = A; v <= B; ++v) {
-        int prevP = gp(v-1), nextC = gc(v+1);
+        int prevP = gp((int64_t)v-1), nextC = gc((int64_t)v+1);
         if (cand[v-A] == 1) { present[v-A] = 1; continue; }
         uint32_t b = pctx_decode(c0, rc);
         present[v-A] = (uint8_t)b;
@@ -93,6 +100,7 @@ void build_inverse(int A, int B, bool flag, const std::vector<uint8_t>& present,
         for (int v = A; v <= B; ++v) at(v) = v;
         out_min = A; out_max = B;
     } else {
+        if (A > 0 || B < 0) throw OFR_StreamError("value remap range excludes zero");
         at(0) = 0;
         int count = 1;
         for (int i = 1; i <= B; ++i) if (i >= A && present[i-A]) { at(count) = i; count++; }
@@ -116,6 +124,7 @@ void OFR_PostProcessor::init2(OFR_RangeCoder* rc, uint32_t channels, uint32_t bi
         B[ch] = sext(rc->read_uniform_split(bit_depth), bit_depth);
         flag[ch] = rc->read_uniform_bits(1) != 0;
         if (flag[ch]) {
+            check_remap_range(A[ch], B[ch]);
             has_remap = true;
             int tidx = (int)uni(rc, 16);
             uint64_t lo32 = read32(rc);
@@ -128,6 +137,7 @@ void OFR_PostProcessor::init2(OFR_RangeCoder* rc, uint32_t channels, uint32_t bi
     int mn[2] = {0, 0}, mx[2] = {0, 0};
     for (uint32_t ch = 0; ch < channels; ++ch) {
         if (has_remap) {
+            check_remap_range(A[ch], B[ch]);
             build_inverse(A[ch], B[ch], flag[ch], present[ch], remap_tbl[ch], remap_lo[ch], mn[ch], mx[ch]);
         } else {
             mn[ch] = A[ch]; mx[ch] = B[ch];
@@ -136,4 +146,8 @@ void OFR_PostProcessor::init2(OFR_RangeCoder* rc, uint32_t channels, uint32_t bi
 
     min_val_L = mn[0]; max_val_L = mx[0]; mult_L = 1; offset_L = 0;
     if (channels == 2) { min_val_R = mn[1]; max_val_R = mx[1]; mult_R = 1; offset_R = 0; }
+    scaled_min_L = min_val_L; scaled_max_L = max_val_L;
+    scaled_min_R = min_val_R; scaled_max_R = max_val_R;
+    full_range_clamp = false;
+    wide = false;
 }

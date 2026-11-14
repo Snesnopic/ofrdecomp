@@ -1,18 +1,7 @@
-#include "optimfrog_tables.h"
+#include "../../include/optimfrog_tables.h"
 #include "../../include/optimfrog_decoder.h"
+#include <algorithm>
 #include <cmath>
-
-// Left-shifting a negative int is UB pre-C++20 (well-defined two's-complement wraparound only
-// from C++20 on); this codebase's shift-wrap trick relies on exactly that wraparound (matching
-// the reference binary's native x86 SHL, which doesn't care about sign) to truncate a value to
-// data_bits precision, so route it through an unsigned shift -- identical bit pattern on every
-// real compiler/target, just standards-defined instead of formally UB.
-static inline int32_t shl_wrap(int32_t x, int sh) { return (int32_t)((uint32_t)x << sh); }
-
-OFR_Predictor::OFR_Predictor() : order(0), shift(0), min_val(-0x800000), max_val(0x7fffff), integrate(0) {
-    history_head = history_buffer.data();
-    for(int i=0; i<8; i++) last_int[i] = 0;
-}
 
 void OFR_Predictor::init(int ord, int interval, double damp) {
 
@@ -35,32 +24,16 @@ void OFR_Predictor::init(int ord, int interval, double damp) {
     history_head = history_buffer.data() + hist_size - order;
 }
 
-void OFR_Predictor::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/) {
-    uint32_t uVar11 = rc->read_uniform_bits(12);
-    int weight_param = 0;
-    if (uVar11 == 0xfff) {
-        weight_param = rc->read_uniform_split(16) + 0x1001;
-    } else {
-        weight_param = uVar11 + 2;
-    }
-    
-    uint32_t uVar12 = rc->read_uniform_bits(3);
-    int interval = 0;
-    if (uVar12 == 7) {
-        interval = rc->read_uniform_split(16) + 1;
-    } else {
-        interval = DAT_00326238[uVar12];
-    }
-    
-    uint32_t uVar13 = rc->read_uniform_bits(5);
-    int ord = 0;
-    if (uVar13 != 31) {
-        ord = DAT_00326220[uVar13];
-    } else {
-        ord = rc->read_uniform_bits(8) + 1;
-    }
-    
-    // NO COEFFICIENTS LOOP!
+void OFR_Predictor::init(OFR_RangeCoder* rc) {
+    uint32_t w = rc->read_uniform_bits(12);
+    int weight_param = (w == 0xfff) ? (int)rc->read_uniform_split(16) + 0x1001 : (int)w + 2;
+
+    uint32_t iv = rc->read_uniform_bits(3);
+    int interval = (iv == 7) ? (int)rc->read_uniform_split(16) + 1 : DAT_00326238[iv];
+
+    uint32_t od = rc->read_uniform_bits(5);
+    int ord = (od != 31) ? DAT_00326220[od] : (int)rc->read_uniform_bits(8) + 1;
+    if (ord < 1 || ord > OFR_MAX_ORDER) throw OFR_StreamError("invalid predictor order");
 
     this->init(ord, interval, ((double)weight_param - 1.0) / (double)weight_param);
 }
@@ -221,230 +194,66 @@ void OFR_Predictor::update(double sample) {
     }
 }
 
-void OFR_Predictor::decode(int* dest, int count) {
+void OFR_Predictor::decode(int32_t* dest, uint32_t count) {
     int sh = shift & 0x1f;
-    for (int i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < count; i++) {
         int error = dest[i];
-        double rounded = std::round(predict());
-        // same cvtsd2si-overflow sentinel as the stereo path (round_to_int32_cvtsd2si);
-        // keeps this function's existing round() semantics for the in-range case and only
-        // fixes the int32 cast overflow, which only 32-bit-range content can hit.
-        int p = (rounded < -2147483648.0 || rounded > 2147483647.0) ? INT32_MIN : (int)rounded;
+        int p = round_to_int32_cvtsd2si(predict());
         int cp = std::max(min_val, std::min(p, max_val));
-        int v = shl_wrap(cp + error, sh) >> sh;
+        int v = ofr_wrap_add(cp, error, sh);
+        if (v < min_val || v > max_val) throw OFR_StreamError("reconstructed sample out of range");
         dest[i] = v;
         update((double)v);
     }
 }
 
-// Emulates the x86 cvtsd2si/cvttsd2si "integer indefinite" behavior: when the rounded
-// double doesn't fit in int32, hardware yields INT32_MIN (0x80000000), not a modular
-// wraparound. `(int32_t)lrint(x)` goes through a 64-bit long first, so out-of-range
-// values silently wrap instead of saturating to that sentinel -- invisible at 16/24-bit
-// (predictions never approach +-2^31 there) but wrong once a 32-bit-range predictor
-// overshoots INT32_MAX (e.g. extrapolating a ramp that's about to clamp/wrap).
-static inline int32_t round_to_int32_cvtsd2si(double x) {
-    long lr = std::lrint(x);
-    return (lr < INT32_MIN || lr > INT32_MAX) ? INT32_MIN : (int32_t)lr;
-}
-
-static uint32_t read_uniform_bits(OFR_RangeCoder* rc, uint32_t bits) {
-    return rc->read_uniform_bits(bits);
-}
-
-static uint32_t read_uniform_bits_8(OFR_RangeCoder* rc) {
-    return read_uniform_bits(rc, 8);
-}
-static uint32_t read_uniform_bits_16(OFR_RangeCoder* rc) {
-    return (read_uniform_bits(rc, 8) << 8) | read_uniform_bits(rc, 8);
-}
-
-void OFR_PredictorFastStereo::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/) {
-    uint32_t v1 = read_uniform_bits(rc, 12);
-    if (v1 == 0xfff) v1 = read_uniform_bits_16(rc) + 0x1001;
-    else v1 += 2;
-    
-    uint32_t v2 = read_uniform_bits(rc, 3);
-    if (v2 == 7) v2 = read_uniform_bits_16(rc) + 1;
-    
-    uint32_t v3 = read_uniform_bits(rc, 5);
-    uint32_t order1, order2;
-    if (v3 == 0x1f) {
-        order1 = read_uniform_bits_8(rc) + 1;
-        order2 = read_uniform_bits_8(rc);
-    } else {
-        int order_map[] = {12, 24, 36, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768};
-        if (v3 < sizeof(order_map)/sizeof(order_map[0])) {
-            order1 = order_map[v3];
-            order2 = order_map[v3];
-        } else {
-            order1 = 12;
-            order2 = 12;
-        }
+static inline int32_t post1_sample(int32_t v, bool wide, int mult, int offset, int mn, int mx) {
+    if (wide) {
+        int64_t s = (int64_t)(uint32_t)mult * (int64_t)v + offset;
+        if (s <= mn) return mn;
+        return s > mx ? mx : (int32_t)s;
     }
-    
-    uint32_t cc_count = read_uniform_bits(rc, 3);
-    if (cc_count == 7) cc_count = 8;
-    else cc_count += 1;
-    
-    uint32_t b = read_uniform_bits(rc, 1);
-    if (b) {
-        read_uniform_bits(rc, 10);  // consume, value unused on this path
-    }
-
-    uint32_t cc_update = read_uniform_bits(rc, 12);
-    if (cc_update == 0xfff) cc_update = read_uniform_bits_16(rc) + 0x1001;
-    else cc_update += 2;
-
-    read_uniform_bits(rc, 3);  // consume, value unused on this path
-    uint32_t b2 = read_uniform_bits(rc, 1);
-    if (b2) {
-        read_uniform_bits_16(rc);  // consume, value unused on this path
-    }
-
-    for (uint32_t i = 0; i < cc_count; i++) {
-        uint32_t w = read_uniform_bits(rc, 5);
-        if (w == 0x1f) {
-            read_uniform_bits_8(rc);  // consume, value unused on this path
-            read_uniform_bits_8(rc);
-        }
-        read_uniform_bits(rc, 10);  // consume, value unused on this path
-    }
-    
-    int update_map[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144};
-    int upd = 256;
-    if (v2 < sizeof(update_map)/sizeof(update_map[0])) upd = update_map[v2];
-    
-    this->left_predictor.init(order1, upd, 1.0);
-    this->right_predictor.init(order2, upd, 1.0);
+    int32_t s = (int32_t)((uint32_t)mult * (uint32_t)v + (uint32_t)offset);
+    if (s <= mn) return mn;
+    return s > mx ? mx : s;
 }
 
-void OFR_PredictorFastStereo::decode(int* dest, int count) {
-    if (count == 0) return;
-    
-    int min_val_L = left_predictor.min_val;
-    int max_val_L = left_predictor.max_val;
-    int min_val_R = right_predictor.min_val;
-    int max_val_R = right_predictor.max_val;
-    int shift = left_predictor.shift;
-    
-    for (int i = 0; i < count; i += 2) { 
-        if (flag == 0) {
-            int left = dest[i];
-            double left_pred = left_predictor.predict();
-            int left_pred_int = (int)std::round(left_pred);
-            if (left_pred_int < min_val_L) left_pred_int = min_val_L;
-            if (left_pred_int > max_val_L) left_pred_int = max_val_L;
-            
-            left = (left_pred_int + shl_wrap(left, shift)) >> shift;
-            dest[i] = left;
-            left_predictor.update(left);
-            right_predictor.update(left);
-            
-            if (cross_channel == 0) {
-                int right = dest[i + 1];
-                double right_pred = right_predictor.predict();
-                int right_pred_int = (int)std::round(right_pred);
-                if (right_pred_int < min_val_R) right_pred_int = min_val_R;
-                if (right_pred_int > max_val_R) right_pred_int = max_val_R;
-                
-                right = (right_pred_int + shl_wrap(right, shift)) >> shift;
-                dest[i + 1] = right;
-                right_predictor.update(right);
-                left_predictor.update(right);
-            } else {
-                int right = dest[i + 1];
-                double right_pred = left_predictor.predict();
-                int right_pred_int = (int)std::round(right_pred);
-                if (right_pred_int < min_val_R) right_pred_int = min_val_R;
-                if (right_pred_int > max_val_R) right_pred_int = max_val_R;
-                
-                right = (right_pred_int + shl_wrap(right, shift)) >> shift;
-                dest[i + 1] = right;
-                left_predictor.update(right);
-                right_predictor.update(right);
-            }
-        } else {
-            int left = dest[i];
-            double left_pred = right_predictor.predict();
-            int left_pred_int = (int)std::round(left_pred);
-            if (left_pred_int < min_val_L) left_pred_int = min_val_L;
-            if (left_pred_int > max_val_L) left_pred_int = max_val_L;
-            
-            left = (left_pred_int + shl_wrap(left, shift)) >> shift;
-            dest[i] = left;
-            right_predictor.update(left);
-            left_predictor.update(left);
-            
-            if (cross_channel != 0) {
-                int right = dest[i + 1];
-                double right_pred = right_predictor.predict();
-                int right_pred_int = (int)std::round(right_pred);
-                if (right_pred_int < min_val_R) right_pred_int = min_val_R;
-                if (right_pred_int > max_val_R) right_pred_int = max_val_R;
-                
-                right = (right_pred_int + shl_wrap(right, shift)) >> shift;
-                dest[i + 1] = right;
-                right_predictor.update(right);
-                left_predictor.update(right);
-            } else {
-                int right = dest[i + 1];
-                double right_pred = left_predictor.predict();
-                int right_pred_int = (int)std::round(right_pred);
-                if (right_pred_int < min_val_R) right_pred_int = min_val_R;
-                if (right_pred_int > max_val_R) right_pred_int = max_val_R;
-                
-                right = (right_pred_int + shl_wrap(right, shift)) >> shift;
-                dest[i + 1] = right;
-                left_predictor.update(right);
-                right_predictor.update(right);
-            }
-        }
-    }
-}
-
-void OFR_PostProcessor::decode(int* dest, int count, int channels) {
-    if (count == 0) return;
+// FUN_000170e0 / FUN_00017700. identity channels are left alone unless the block asks for the
+// full range clamp, everything else is scaled back and clamped.
+void OFR_PostProcessor::decode(int32_t* dest, uint32_t count) {
     if (has_remap) {
-        // post_type=2 value-remap: dense index -> sparse original value
-        for (int i = 0; i < count * channels; i += channels) {
-            for (int ch = 0; ch < channels; ++ch)
-                dest[i + ch] = remap_tbl[ch][dest[i + ch] - remap_lo[ch]];
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t ch = i % m_channels;
+            int64_t idx = (int64_t)dest[i] - remap_lo[ch];
+            if (idx < 0 || idx >= (int64_t)remap_tbl[ch].size()) throw OFR_StreamError("value outside the remap table");
+            dest[i] = remap_tbl[ch][(size_t)idx];
         }
         return;
     }
-    for (int i = 0; i < count * channels; i += channels) {
-        if (m_channels == 1) {
-            int32_t left = dest[i];
-            int64_t left_scaled = (int64_t)(uint32_t)mult_L * (int64_t)left + offset_L;
-            if (left_scaled <= min_val_L) left_scaled = min_val_L;
-            else if (left_scaled > max_val_L) left_scaled = max_val_L;
-            dest[i] = (int32_t)left_scaled;
-        } else {
-            int right = dest[i + 1];
 
-            int64_t left_scaled = (int64_t)(uint32_t)mult_L * (int64_t)dest[i] + offset_L;
-            if (left_scaled <= min_val_L) left_scaled = min_val_L;
-            else if (left_scaled > max_val_L) left_scaled = max_val_L;
-            dest[i] = (int)left_scaled;
-
-            int64_t right_scaled = (int64_t)(uint32_t)mult_R * (int64_t)right + offset_R;
-            if (right_scaled <= min_val_R) right_scaled = min_val_R;
-            else if (right_scaled > max_val_R) right_scaled = max_val_R;
-            dest[i + 1] = (int)right_scaled;
-        }
+    const bool active_L = mult_L != 1 || offset_L != 0 || full_range_clamp;
+    const bool active_R = mult_R != 1 || offset_R != 0 || full_range_clamp;
+    if (m_channels == 1) {
+        if (!active_L) return;
+        for (uint32_t i = 0; i < count; i++)
+            dest[i] = post1_sample(dest[i], wide, mult_L, offset_L, min_val_L, max_val_L);
+        return;
+    }
+    for (uint32_t i = 0; i + 1 < count; i += 2) {
+        if (active_L) dest[i] = post1_sample(dest[i], wide, mult_L, offset_L, min_val_L, max_val_L);
+        if (active_R) dest[i + 1] = post1_sample(dest[i + 1], wide, mult_R, offset_R, min_val_R, max_val_R);
     }
 }
 
 void OFR_PredictorStereo_Inner::init(double weight, int max_order, int left_order, uint32_t update_interval) {
-    std::memset(this, 0, 0x65C70);
+    std::memset(this, 0, sizeof(*this));
     m_max_order = max_order;
     m_left_order = left_order;
     m_right_order = max_order - left_order;
     m_update_interval = update_interval;
     m_weight = weight;
-    m_left_hist_ptr = &m_left_history[1024 - left_order];
-    m_right_hist_ptr = &m_right_history[1024 - left_order];
+    m_left_hist_ptr = &m_left_history[HISTORY - left_order];
+    m_right_hist_ptr = &m_right_history[HISTORY - left_order];
     m_left_coefs[0] = 1.0;
     m_right_coefs[0] = 1.0;
 }
@@ -559,34 +368,26 @@ void OFR_PredictorStereo_Inner::updateAutocorrRight() {
 
 void OFR_PredictorStereo::decode(int32_t* outputs, uint32_t num_samples) {
     if (m_need_init) {
-        double w = (static_cast<double>(m_weight_param) - 1.0) / static_cast<double>(m_weight_param);
-        m_inner.init(w, m_max_order, m_max_order - m_right_order, m_update_interval);
-        m_sample_counter = 0xac44;
+        double w = (static_cast<double>(m_params.weight_param) - 1.0) / static_cast<double>(m_params.weight_param);
+        m_inner.init(w, m_params.max_order, m_params.max_order - m_params.right_order, m_params.update_interval);
         m_need_init = false;
     }
-    if (num_samples == 0) return;
 
     int shift = (int)(m_shift & 0x1f);
     for (uint32_t i = 0; i < num_samples; i += 2) {
-        m_sample_counter--;
-        if (m_sample_counter == 0) {
-            if (m_progress_cb) m_progress_cb(static_cast<double>(i) / num_samples);
-            m_sample_counter = 0xac44;
-        }
-
-        // left
         int32_t res = outputs[i];
         int32_t pr  = round_to_int32_cvtsd2si(m_inner.predictLeft());
         int32_t cl  = std::max(m_left_min, std::min(pr, m_left_max));
-        int32_t v   = shl_wrap(cl + res, shift) >> shift;
+        int32_t v   = ofr_wrap_add(cl, res, shift);
+        if (v < m_left_min || v > m_left_max) throw OFR_StreamError("reconstructed sample out of range");
         outputs[i] = v;
         m_inner.updateLeft((double)v);
 
-        // right
         res = outputs[i + 1];
         pr  = round_to_int32_cvtsd2si(m_inner.predictRight());
         int32_t cr = std::max(m_right_min, std::min(pr, m_right_max));
-        v = shl_wrap(cr + res, shift) >> shift;
+        v = ofr_wrap_add(cr, res, shift);
+        if (v < m_right_min || v > m_right_max) throw OFR_StreamError("reconstructed sample out of range");
         outputs[i + 1] = v;
         m_inner.updateRight((double)v);
     }
@@ -865,10 +666,10 @@ void OFR_PredictorStereo_Inner::updateLeft(double sample) {
     if (m_left_hist_ptr == &m_left_history[0]) {
         if (m_left_order > 0) {
             for (int i = 0; i < m_left_order; ++i) {
-                m_left_history[1024 - m_left_order + i] = m_left_history[i];
+                m_left_history[HISTORY - m_left_order + i] = m_left_history[i];
             }
         }
-        m_left_hist_ptr = &m_left_history[1024 - m_left_order];
+        m_left_hist_ptr = &m_left_history[HISTORY - m_left_order];
     }
     
     m_left_hist_ptr--;
@@ -908,10 +709,8 @@ void OFR_PredictorStereo_Inner::updateLeft(double sample) {
             if (m_R_left[0] < 9.31322574615478515625e-10 && m_R_left[0] != 0.0) {
                 std::memset(m_R_left, 0, (m_max_order * 2 + 1) * sizeof(double));
             }
-            if (!m_is_cholesky_fail_left) {
-                solveCholeskyLeft();
-                m_update_count_left = m_count_left;
-            }
+            solveCholeskyLeft();
+            m_update_count_left = m_count_left;
         }
     }
 }
@@ -920,10 +719,10 @@ void OFR_PredictorStereo_Inner::updateRight(double sample) {
     if (m_right_hist_ptr == &m_right_history[0]) {
         if (m_left_order > 0) {
             for (int i = 0; i < m_left_order; ++i) {
-                m_right_history[1024 - m_left_order + i] = m_right_history[i];
+                m_right_history[HISTORY - m_left_order + i] = m_right_history[i];
             }
         }
-        m_right_hist_ptr = &m_right_history[1024 - m_left_order];
+        m_right_hist_ptr = &m_right_history[HISTORY - m_left_order];
     }
     
     m_right_hist_ptr--;
@@ -960,75 +759,34 @@ void OFR_PredictorStereo_Inner::updateRight(double sample) {
             if (m_R_right[0] < 9.31322574615478515625e-10 && m_R_right[0] != 0.0) {
                 std::memset(m_R_right, 0, (m_max_order * 2 + 1) * sizeof(double));
             }
-            if (!m_is_cholesky_fail_right) {
-                solveCholeskyRight();
-                m_update_count_right = m_count_right;
-            }
+            solveCholeskyRight();
+            m_update_count_right = m_count_right;
         }
     }
 }
 
-void OFR_PredictorStereo::init(OFR_RangeCoder* rc, uint32_t bit_depth) {
-    uint32_t uVar11 = rc->read_uniform_bits(12);
-    if (uVar11 == 0xfff) {
-        m_weight_param = rc->read_uniform_bits(16) + 0x1001;
+void OFR_StereoLpcParams::read(OFR_RangeCoder* rc) {
+    uint32_t w = rc->read_uniform_bits(12);
+    weight_param = (w == 0xfff) ? rc->read_uniform_bits(16) + 0x1001 : w + 2;
+
+    uint32_t iv = rc->read_uniform_bits(3);
+    update_interval = (iv == 7) ? rc->read_uniform_bits(16) + 1 : (uint32_t)DAT_00326238[iv];
+
+    uint32_t od = rc->read_uniform_bits(5);
+    if (od != 31) {
+        max_order = DAT_00326220[od];
+        right_order = DAT_00326200[od];
     } else {
-        m_weight_param = uVar11 + 2;
+        max_order = (int32_t)rc->read_uniform_bits(8) + 1;
+        right_order = (int32_t)rc->read_uniform_bits(8);
     }
-    
-    uint32_t uVar12 = rc->read_uniform_bits(3);
-    if (uVar12 == 7) {
-        m_update_interval = rc->read_uniform_bits(16) + 1;
-    } else {
-        m_update_interval = DAT_00326238[uVar12];
-    }
-    
-    uint32_t uVar13 = rc->read_uniform_bits(5);
-    if (uVar13 != 31) {
-        m_max_order = DAT_00326220[uVar13];
-        m_right_order = DAT_00326200[uVar13];
-        m_is_fast = true;
-    } else {
-        m_max_order = rc->read_uniform_bits(8) + 1;
-        m_right_order = rc->read_uniform_bits(8);
-        m_is_fast = false;
-    }
-    m_shift = 32 - bit_depth;
+
+    // the right history is rewound by left_order entries, so the right part can't be the larger one
+    if (max_order < 1 || max_order > OFR_MAX_ORDER || right_order > max_order - right_order)
+        throw OFR_StreamError("invalid stereo predictor order");
+}
+
+void OFR_PredictorStereo::init(OFR_RangeCoder* rc) {
+    m_params.read(rc);
     m_need_init = true;
 }
-
-void OFR_PostProcessor::init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t channels) {
-    m_channels = channels;
-    auto sign_extend = [](uint32_t val, uint32_t bits) -> int32_t {
-        uint32_t shift = 32 - bits;
-        return ((int32_t)(val << shift)) >> shift;
-    };
-
-    min_val_L = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
-    max_val_L = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
-
-    uint32_t b = rc->read_uniform_bits(1);
-    if (b == 0) {
-        mult_L = 1;
-        offset_L = 0;
-    } else {
-        mult_L = rc->read_uniform_split(bit_depth);
-        offset_L = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
-    }
-
-    if (channels == 2) {
-        min_val_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
-        max_val_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
-
-        b = rc->read_uniform_bits(1);
-        if (b == 0) {
-            mult_R = 1;
-            offset_R = 0;
-        } else {
-            mult_R = rc->read_uniform_split(bit_depth);
-            offset_R = sign_extend(rc->read_uniform_split(bit_depth), bit_depth);
-        }
-    }
-}
-
-

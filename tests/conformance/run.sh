@@ -4,7 +4,8 @@
 #   B) every .ofr our encoder produces, the reference decoder decodes losslessly
 # Correctness only; runtime is irrelevant by design.
 #
-# Env knobs: NFILES (corpus files, default 8), PRESETS, BPSLIST, OURDEC=0 to skip our-decoder side.
+# Env knobs: NFILES (corpus files, default 8), PRESETS, BPSLIST, OURDEC=0 to skip our-decoder side,
+# LEGACY_MODES (reference --mode values for direction A), LONG=1 (multi-block signals).
 set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -21,6 +22,7 @@ NFILES="${NFILES:-8}"
 OURDEC="${OURDEC:-1}"
 
 mkdir -p "$WORK/raw" "$WORK/tmp"
+: > "$WORK/block_types.txt"
 pass=0; fail=0; faillog="$WORK/failures.txt"; : > "$faillog"
 note() { echo "FAIL: $*" >> "$faillog"; fail=$((fail+1)); }
 ok()   { pass=$((pass+1)); }
@@ -33,6 +35,9 @@ cc_of() { [ "$1" = 2 ] && echo STEREO_LR || echo MONO; }
 # output and is never hidden by retry.
 rtry_out() { local out="$1"; shift; local i; for i in 1 2 3; do rm -f "$out"; "$@" >/dev/null 2>&1; [ -s "$out" ] && return 0; done; return 1; }
 
+# a preset, or mode:x for the reference's older --mode x
+level_flag() { case "$1" in mode:*) echo "--mode ${1#mode:}";; *) echo "--preset $1";; esac; }
+
 refdec() { rtry_out "$2" env DYLD_LIBRARY_PATH="$DYLIBDIR" LD_LIBRARY_PATH="$DYLIBDIR" "$REFGEN" "$1" "$2"; }
 ourdec() { rm -f "$WORK/tmp/test.raw"; local i; for i in 1 2 3; do ( cd "$WORK/tmp" && "$ODEC" "$1" >/dev/null 2>&1 ); [ -s "$WORK/tmp/test.raw" ] && { cp -f "$WORK/tmp/test.raw" "$2"; return 0; }; done; return 1; }
 
@@ -42,8 +47,9 @@ dirA() {
   local st cc; st=$(st_of "$bps"); cc=$(cc_of "$ch")
   for p in $plist; do
     local of="$WORK/tmp/a.ofr" rr="$WORK/tmp/a_ref.raw" ro="$WORK/tmp/a_our.raw"
-    rtry_out "$of" "$OFR" --preset "$p" --encode --raw --channelconfig "$cc" --sampletype "$st" --rate "$rate" "$raw" --output "$of"
+    rtry_out "$of" "$OFR" $(level_flag "$p") --encode --raw --channelconfig "$cc" --sampletype "$st" --rate "$rate" "$raw" --output "$of"
     if [ ! -s "$of" ]; then note "A enc $tag p$p (no ofr output)"; continue; fi
+    python3 "$ROOT/tests/conformance/block_types.py" "$of" >> "$WORK/block_types.txt"
     refdec "$of" "$rr"
     if ! cmp -s "$raw" "$rr"; then note "A ref-decode $tag p$p (ref != original)"; else ok; fi
     if [ "$OURDEC" = 1 ]; then
@@ -63,6 +69,13 @@ dirB() {
       best)    rtry_out "$of" env OFR_BEST=1 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
       ent2)    rtry_out "$of" env OFR_PRED=1 OFR_ENT=2 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
       pred3)   rtry_out "$of" env OFR_PRED=3 OFR_ENT=3 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
+      pred2)   rtry_out "$of" env OFR_PRED=2 OFR_ENT=1 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
+      pred2e3) rtry_out "$of" env OFR_PRED=2 OFR_ENT=3 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
+      blocks)  rtry_out "$of" env OFR_PRED=1 OFR_ENT=2 OFR_BLOCK=1500 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
+      blocksp3) rtry_out "$of" env OFR_PRED=3 OFR_ENT=2 OFR_BLOCK=1500 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
+      # every order the format's tables offer within the 128-row matrices (127 is the mono limit)
+      order*)  local idx="${mode#order}" orders=(12 24 36 48 64 96 127)
+               rtry_out "$of" env OFR_PRED=1 OFR_ENT=1 OFR_ODIDX="$idx" OFR_ORDER="${orders[$idx]}" "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
     esac
     if [ ! -s "$of" ]; then note "B enc $tag $mode (no output)"; continue; fi
     refdec "$of" "$rr"
@@ -100,9 +113,21 @@ CORPUS_PRESETS="${CORPUS_PRESETS:-$PRESETS}"
 HEAVYPRESETS="${HEAVYPRESETS:-10 max}"
 HEAVYN="${HEAVYN:-9999}"
 SKIP_DIRA="${SKIP_DIRA:-0}"    # set to 1 when the reference `ofr` encoder binary isn't available (e.g. CI)
-SYNTH_BMODES="${SYNTH_BMODES:-default best ent2 pred3}"
+SYNTH_BMODES="${SYNTH_BMODES:-default best ent2 pred3 pred2 pred2e3 blocks blocksp3 order2 order3 order4 order5 order6}"
 CORPUS_BMODES="${CORPUS_BMODES:-default best ent2 pred3}"
 CORPUS_BMODES_LIGHT="${CORPUS_BMODES_LIGHT:-default ent2 pred3}"
+
+# LEGACY_MODES: the reference's pre-preset modes, the expected source of pred_type=2 streams
+LEGACY_MODES="${LEGACY_MODES:-}"
+if [ -n "$LEGACY_MODES" ] && [ "$SKIP_DIRA" != 1 ]; then
+  probe=$(ls "$WORK"/synth/*__1ch__16bps.raw | head -1)
+  rtry_out "$WORK/tmp/probe.ofr" "$OFR" --mode "${LEGACY_MODES%% *}" --encode --raw --channelconfig MONO --sampletype SINT16 --rate 44100 "$probe" --output "$WORK/tmp/probe.ofr"
+  if [ -s "$WORK/tmp/probe.ofr" ]; then
+    for m in $LEGACY_MODES; do SYNTH_PRESETS="$SYNTH_PRESETS mode:$m"; done
+  else
+    echo "the reference encoder refused --mode: skipping the legacy modes"
+  fi
+fi
 
 is_heavy() { case " $HEAVYPRESETS " in *" $1 "*) return 0;; *) return 1;; esac; }
 
@@ -129,6 +154,23 @@ for bps in $BPSLIST; do
     run_raw "$r" "$fch" "$bps" 44100 "$base" "$plist" "$bmodes"
   done
 done
+
+# signals long enough for the reference to split them into many blocks
+if [ "${LONG:-0}" = 1 ]; then
+  echo "=== long signals ==="
+  python3 "$ROOT/tests/conformance/gen_long.py" "$WORK/long" >/dev/null
+  LONG_PRESETS="${LONG_PRESETS:-0 2}"
+  LONG_BMODES="${LONG_BMODES:-default blocks}"
+  for r in "$WORK"/long/*.raw; do
+    base=$(basename "$r")
+    fch=$(echo "$base" | sed -E 's/.*__([0-9]+)ch__.*/\1/')
+    fbps=$(echo "$base" | sed -E 's/.*__([0-9]+)bps\.raw/\1/')
+    run_raw "$r" "$fch" "$fbps" 44100 "$base" "$LONG_PRESETS" "$LONG_BMODES"
+  done
+fi
+
+echo "=== block types in the reference's files (post/pred/ent : blocks) ==="
+sort "$WORK/block_types.txt" | uniq -c | sort -rn | head -40
 
 echo "=== RESULTS ==="
 echo "PASS=$pass FAIL=$fail"

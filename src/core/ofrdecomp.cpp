@@ -1,125 +1,239 @@
 #include "../../include/ofrdecomp.hpp"
 #include "../../include/OptimFROG.h"
+#include "../../include/optimfrog_decoder.h"
 #include "../../include/optimfrog_encoder.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+
+#if defined(_WIN32)
+#define ofr_fseek _fseeki64
+#define ofr_ftell _ftelli64
+#else
+#define ofr_fseek fseeko
+#define ofr_ftell ftello
+#endif
 
 namespace ofrdecomp {
 
 DecodeError::~DecodeError() = default;
+EncodeError::~EncodeError() = default;
+Stream::~Stream() = default;
 
-Decoder::Decoder(const std::string& path) {
-    instance_ = OptimFROG_createInstance();
-    if (!instance_) throw DecodeError("OptimFROG_createInstance failed", OptimFROG_MemoryError);
-    condition_t res = OptimFROG_open(instance_, const_cast<char*>(path.c_str()), 0);
-    if (res != OptimFROG_NoError) {
-        OptimFROG_destroyInstance(instance_);
-        instance_ = nullptr;
-        throw DecodeError("cannot open " + path, (int)res);
+namespace {
+
+class FileStream : public Stream {
+public:
+    explicit FileStream(const std::string& path) : file_(fopen(path.c_str(), "rb")) {
+        if (!file_) throw DecodeError("cannot open " + path, OptimFROG_OpenError);
     }
-}
+    ~FileStream() override { fclose(file_); }
+    FileStream(const FileStream&) = delete;
+    FileStream& operator=(const FileStream&) = delete;
 
-Decoder::~Decoder() {
-    if (instance_) {
-        OptimFROG_close(instance_);
-        OptimFROG_destroyInstance(instance_);
-    }
-}
-
-Decoder::Decoder(Decoder&& other) noexcept : instance_(other.instance_) {
-    other.instance_ = nullptr;
-}
-
-Decoder& Decoder::operator=(Decoder&& other) noexcept {
-    if (this != &other) {
-        if (instance_) {
-            OptimFROG_close(instance_);
-            OptimFROG_destroyInstance(instance_);
+    size_t read(void* dest, size_t count) override { return fread(dest, 1, count, file_); }
+    bool seekable() const override { return ofr_fseek(file_, 0, SEEK_CUR) == 0; }
+    int64_t position() const override { return ofr_ftell(file_); }
+    bool seek(int64_t pos) override { return ofr_fseek(file_, pos, SEEK_SET) == 0; }
+    int64_t length() const override {
+        int64_t pos = ofr_ftell(file_), size = 0;
+        if (pos >= 0 && ofr_fseek(file_, 0, SEEK_END) == 0) {
+            size = ofr_ftell(file_);
+            ofr_fseek(file_, pos, SEEK_SET);
         }
-        instance_ = other.instance_;
-        other.instance_ = nullptr;
+        return size;
     }
-    return *this;
+
+private:
+    FILE* file_;
+};
+
+class MemoryStream : public Stream {
+public:
+    explicit MemoryStream(std::span<const uint8_t> data) : data_(data) {}
+
+    size_t read(void* dest, size_t count) override {
+        size_t n = std::min(count, data_.size() - pos_);
+        if (n) std::memcpy(dest, data_.data() + pos_, n);
+        pos_ += n;
+        return n;
+    }
+    bool seekable() const override { return true; }
+    int64_t length() const override { return (int64_t)data_.size(); }
+    int64_t position() const override { return (int64_t)pos_; }
+    bool seek(int64_t pos) override {
+        if (pos < 0 || (uint64_t)pos > data_.size()) return false;
+        pos_ = (size_t)pos;
+        return true;
+    }
+
+private:
+    std::span<const uint8_t> data_;
+    size_t pos_ = 0;
+};
+
+// the engine's reader interface, forwarding to a Stream
+Stream* stream_of(void* instance) { return static_cast<Stream*>(instance); }
+
+ReadInterface stream_interface = {
+    [](void*) -> condition_t { return C_TRUE; },
+    [](void* s, void* dest, uInt32_t count) -> sInt32_t { return (sInt32_t)stream_of(s)->read(dest, count); },
+    [](void*) -> condition_t { return C_FALSE; },
+    [](void* s) -> condition_t { return stream_of(s)->seekable() ? C_TRUE : C_FALSE; },
+    [](void* s) -> sInt64_t { return stream_of(s)->length(); },
+    [](void* s) -> sInt64_t { return stream_of(s)->position(); },
+    [](void* s, sInt64_t pos) -> condition_t { return stream_of(s)->seek(pos) ? C_TRUE : C_FALSE; },
+};
+
+OFR_EncodeParams to_params(const EncodeOptions& o) {
+    OFR_EncodeParams p;
+    p.pred = o.predictor;
+    p.ent = o.entropy;
+    p.mono_order = o.monoOrder;
+    p.stereo_order_idx = o.stereoOrderIndex;
+    p.block_frames = o.blockFrames;
+    p.threads = o.threads;
+    p.search = o.search;
+    p.unsigned_samples = o.unsignedSamples;
+    return p;
 }
+
+} // namespace
+
+struct Decoder::Impl {
+    std::unique_ptr<Stream> stream;
+    OFR_DecoderEngine engine;
+    bool tail_read = false;
+
+    explicit Impl(std::unique_ptr<Stream> s) : stream(std::move(s)), engine(&stream_interface, stream.get()) {
+        try {
+            engine.open();
+        } catch (const OFR_StreamError& e) {
+            throw DecodeError(e.what(), OptimFROG_OpenError);
+        }
+    }
+};
+
+Decoder::Decoder(const std::string& path) : impl_(std::make_unique<Impl>(std::make_unique<FileStream>(path))) {}
+Decoder::Decoder(std::span<const uint8_t> memory) : impl_(std::make_unique<Impl>(std::make_unique<MemoryStream>(memory))) {}
+Decoder::Decoder(std::unique_ptr<Stream> stream) : impl_(std::make_unique<Impl>(std::move(stream))) {}
+
+Decoder::~Decoder() = default;
+Decoder::Decoder(Decoder&& other) noexcept = default;
+Decoder& Decoder::operator=(Decoder&& other) noexcept = default;
 
 Info Decoder::info() const {
-    OptimFROG_Info raw; std::memset(&raw, 0, sizeof(raw));
-    OptimFROG_getInfo(instance_, &raw);
+    OFR_DecoderEngine& e = impl_->engine;
     Info out;
-    out.channels = raw.channels;
-    out.samplerate = raw.samplerate;
-    out.bitspersample = raw.bitspersample;
-    out.bitrate = raw.bitrate;
-    out.noPoints = raw.noPoints;
-    out.originalSize = raw.originalSize;
-    out.compressedSize = raw.compressedSize;
-    out.length_ms = raw.length_ms;
+    out.channels = e.channels;
+    out.samplerate = e.samplerate;
+    out.bitspersample = e.bitspersample;
+    out.version = e.version;
+    const OFR_DerivedInfo derived = ofr_derived_info(e);
+    out.noPoints = derived.noPoints;
+    out.originalSize = derived.originalSize;
+    out.compressedSize = derived.compressedSize;
+    out.length_ms = derived.length_ms;
+    out.bitrate = derived.bitrate;
+    out.isFloat = e.is_float;
+    out.method = ofr_method_name(e.method);
+    out.speedup = ofr_speedup_name(e.speedup);
+    out.sampleType = ofr_sample_type_name(e.sample_type);
+    out.channelConfig = ofr_channel_config_name(e.channel_config);
     return out;
 }
 
 size_t Decoder::read(std::span<int32_t> dest, size_t frames) {
-    Info i = info();
-    size_t channels = i.channels ? i.channels : 1;
-    size_t need = frames * channels;
-    if (dest.size() < need) throw DecodeError("Decoder::read: destination span too small", -1);
+    OFR_DecoderEngine& e = impl_->engine;
+    if (dest.size() / e.channels < frames) throw DecodeError("Decoder::read: destination span too small", -1);
 
-    // OptimFROG_read packs samples into their native byte width (bitspersample/8), not raw
-    // int32_t -- unpack + sign-extend here so this API always hands back plain int32 samples.
-    int bpv = (int)i.bitspersample / 8;
-    std::vector<uint8_t> raw(need * (size_t)bpv);
-    int got = OptimFROG_read(instance_, raw.data(), (uInt32_t)frames, 0);
-    if (got < 0) throw DecodeError("OptimFROG_read failed", got);
-
-    size_t n = (size_t)got * channels;
-    int shift = 32 - (int)i.bitspersample;
-    for (size_t k = 0; k < n; k++) {
-        int32_t v = 0;
-        for (int b = 0; b < bpv; b++) v |= (int32_t)raw[k * (size_t)bpv + b] << (8 * b);
-        dest[k] = (v << shift) >> shift;
+    uint64_t remaining = std::min<uint64_t>((uint64_t)frames * e.channels, e.total_samples - e.position);
+    size_t done = 0;
+    try {
+        while (remaining > 0) {
+            uint32_t want = (uint32_t)std::min<uint64_t>(remaining, 1u << 30);
+            uint32_t got = e.read(dest.data() + done, want);
+            if (got == 0) break;
+            done += got;
+            remaining -= got;
+        }
+    } catch (const OFR_StreamError& err) {
+        if (done == 0) throw DecodeError(err.what(), OptimFROG_FatalError);
     }
-    return (size_t)got;
+    return done / e.channels;
 }
 
 std::vector<int32_t> Decoder::readAll() {
-    Info i = info();
-    std::vector<int32_t> out((size_t)i.noPoints * (i.channels ? i.channels : 1));
-    const size_t CHUNK = 65536;
-    size_t done = 0;
-    while (done < (size_t)i.noPoints) {
-        size_t want = std::min(CHUNK, (size_t)i.noPoints - done);
-        std::span<int32_t> dest(out.data() + done * i.channels, want * i.channels);
-        size_t got = read(dest, want);
+    OFR_DecoderEngine& e = impl_->engine;
+    std::vector<int32_t> out;
+    constexpr size_t CHUNK = 1u << 16;
+    while (e.position < e.total_samples) {
+        size_t base = out.size();
+        out.resize(base + CHUNK * e.channels);
+        size_t got = read(std::span<int32_t>(out).subspan(base), CHUNK);
+        out.resize(base + got * e.channels);
         if (got == 0) break;
-        done += got;
     }
-    out.resize(done * (i.channels ? i.channels : 1));
     return out;
 }
 
-bool Decoder::seekable() const { return OptimFROG_seekable(instance_) != C_FALSE; }
-bool Decoder::seek(int64_t frame) { return OptimFROG_seekPoint(instance_, frame) != C_FALSE; }
-bool Decoder::seekTime(int64_t milliseconds) { return OptimFROG_seekTime(instance_, milliseconds) != C_FALSE; }
-int64_t Decoder::pos() const { return OptimFROG_getPos(instance_); }
-bool Decoder::hadRecoverableErrors() const { return OptimFROG_recoverableErrors(instance_) != C_FALSE; }
+bool Decoder::seekable() const { return impl_->engine.stream().seekable(); }
+
+bool Decoder::seek(int64_t frame) {
+    if (frame < 0) return false;
+    try {
+        return impl_->engine.seek((uint64_t)frame * impl_->engine.channels);
+    } catch (const OFR_StreamError&) {
+        return false;
+    }
+}
+
+bool Decoder::seekTime(int64_t milliseconds) {
+    return seek(trunc_to_int64_cvttsd2si((double)milliseconds / 1000.0 * (double)impl_->engine.samplerate));
+}
+
+int64_t Decoder::pos() const { return (int64_t)(impl_->engine.position / impl_->engine.channels); }
+
+bool Decoder::hadRecoverableErrors() const { return impl_->engine.has_recoverable_errors; }
+
+std::span<const uint8_t> Decoder::head() const { return impl_->engine.head; }
+
+std::span<const uint8_t> Decoder::tail() {
+    OFR_DecoderEngine& e = impl_->engine;
+    if (e.position != e.total_samples) throw DecodeError("Decoder::tail: the stream hasn't been read to its end", -1);
+    if (!impl_->tail_read) {
+        try {
+            e.read_tail();
+        } catch (const OFR_StreamError& err) {
+            throw DecodeError(err.what(), OptimFROG_FatalError);
+        }
+        impl_->tail_read = true;
+    }
+    return e.tail;
+}
+
+std::vector<std::pair<std::string, std::string>> Decoder::tags() { return ofr_read_tags(impl_->engine.stream()); }
 
 namespace Encoder {
 
-std::vector<uint8_t> encodeMono(std::span<const int32_t> samples, uint32_t samplerate, int bitspersample,
-                                 std::span<const uint8_t> head, std::span<const uint8_t> tail) {
+std::vector<uint8_t> encode(std::span<const int32_t> samples, int channels, uint32_t samplerate, int bitspersample,
+                            const EncodeOptions& options, std::span<const uint8_t> head, std::span<const uint8_t> tail) {
+    if (channels != 1 && channels != 2) throw EncodeError("channels must be 1 or 2");
     std::vector<uint8_t> file;
     std::vector<uint8_t> h(head.begin(), head.end()), t(tail.begin(), tail.end());
-    if (!ofr_encode_mono(samples.data(), (uint32_t)samples.size(), samplerate, bitspersample, file, h, t))
-        throw DecodeError("ofr_encode_mono failed", -1);
+    if (!ofr_encode(samples.data(), samples.size() / (size_t)channels, channels, samplerate, bitspersample,
+                    to_params(options), file, h, t))
+        throw EncodeError("invalid encoder parameters");
     return file;
 }
 
-std::vector<uint8_t> encodeStereo(std::span<const int32_t> interleaved, uint32_t samplerate, int bitspersample,
-                                   std::span<const uint8_t> head, std::span<const uint8_t> tail) {
+std::vector<uint8_t> encodeFloat(std::span<const float> samples, int channels, uint32_t samplerate,
+                                 const EncodeOptions& options, std::span<const uint8_t> head, std::span<const uint8_t> tail) {
+    if (channels != 1 && channels != 2) throw EncodeError("channels must be 1 or 2");
     std::vector<uint8_t> file;
     std::vector<uint8_t> h(head.begin(), head.end()), t(tail.begin(), tail.end());
-    uint32_t frames = (uint32_t)(interleaved.size() / 2);
-    if (!ofr_encode_stereo(interleaved.data(), frames, samplerate, bitspersample, file, h, t))
-        throw DecodeError("ofr_encode_stereo failed", -1);
+    if (!ofr_encode_float(samples.data(), samples.size() / (size_t)channels, channels, samplerate, to_params(options), file, h, t))
+        throw EncodeError("invalid encoder parameters");
     return file;
 }
 

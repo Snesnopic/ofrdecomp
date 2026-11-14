@@ -1,6 +1,6 @@
 # OptimFROG Reverse Engineering Knowledge Base
 
-This document serves as the master knowledge base for the reverse engineering of the OptimFROG audio codec. It tracks the format details, algorithmic discoveries, and the current state of decompilation as of June 2026.
+This document serves as the master knowledge base for the reverse engineering of the OptimFROG audio codec. It tracks the format details and algorithmic discoveries; [status.md](status.md) has the current state.
 
 ## 1. Bitstream and Block Structure
 
@@ -54,18 +54,3 @@ Takes the predictor output and applies final mapping.
 * For basic files, it simply scales by `multiplier` and adds `offset`.
 * Negative/complex configurations exist but have not been fully mapped out yet.
 
----
-
-## 3. Current Decompilation Status
-
-This section is a historical snapshot from early in the project (mono-only, single-file
-verification). It's kept for context on how the investigation progressed, but is **no longer
-accurate** — see [status.md](status.md) for the current, verified coverage matrix (both
-decoder and encoder, mono+stereo, 8/16/24/32-bit, all predictor/entropy/post-processor types,
-proven via a bidirectional conformance suite against the reference binaries rather than a single
-hand-picked file).
-
-Everything the early to-do list below asked for has since been resolved: predictor
-integration/shift is read from the bitstream (not hardcoded), stereo prediction (both the fast
-and cascade paths) is bit-exact, all three entropy types and both post-processor types are
-implemented, and the block reader handles the full multi-block real-audio case.

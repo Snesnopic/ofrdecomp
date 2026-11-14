@@ -1,5 +1,10 @@
 # pred_type=3 — cascade NLMS predictor (presets 4→max)
 
+`pred_type=2` runs the same cascade alone: no LPC layer and no segment schedule, and its bitstream
+holds only the cascade parameters described here (stage count, decay flag, final combiner weight,
+`k`, Golomb flag and the stages themselves). The official library has classes for it, but none of
+the presets is known to produce it.
+
 Full RE map of the high-compression predictor. Mono object base offsets shown (param_1[0x11]);
 stereo (param_1[0x12]) mirrors at 0x67xxx with two channels + cc alternation.
 

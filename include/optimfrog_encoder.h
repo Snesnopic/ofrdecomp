@@ -2,22 +2,50 @@
 #define OPTIMFROG_ENCODER_H
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 #include "optimfrog_decoder.h"
 
-// public encoder entry points (implemented in src/core/optimfrog_encoder.cpp)
-// head/tail: opaque bytes embedded verbatim in the HEAD/TAIL container blocks (--headersize/
-// --tailsize equivalents), restored bit-exact around the decoded PCM at decode time.
-bool ofr_encode_mono(const int32_t* samples, uint32_t n, uint32_t samplerate, int bps, std::vector<uint8_t>& file,
-                      const std::vector<uint8_t>& head = {}, const std::vector<uint8_t>& tail = {});
-bool ofr_encode_stereo(const int32_t* samples, uint32_t frames, uint32_t samplerate, int bps, std::vector<uint8_t>& file,
-                        const std::vector<uint8_t>& head = {}, const std::vector<uint8_t>& tail = {});
+// what the encoder writes into a block. every value ends up in the bitstream and the decoder reads
+// it back, so none of this has to match what the reference encoder would have picked.
+struct OFR_EncodeParams {
+    int pred = 1;                       // 1 LPC, 2 cascade NLMS, 3 LPC + cascade NLMS
+    int ent = 1;                        // 1 fast, 2 slow, 3 ACM
+    int mono_order = 64;                // pred=1 mono LPC order
+    int mono_interval = 32;             // pred=1 mono weight update interval
+    int stereo_order_idx = 1;           // index into the stereo order tables
+    int stereo_interval_idx = 0;        // index into the update interval table
+    uint32_t pred_weight = 256;         // pred=1 covariance window
+    uint32_t ent_weight = 16;           // ent=1/2 variance window
+    uint32_t block_frames = 0;          // frames per COMP block, 0 for as few blocks as possible
+    uint32_t threads = 1;               // blocks encoded in parallel
+    bool search = false;                // per block, keep the smallest of a set of known-good configs
+    bool unsigned_samples = false;      // tag the file as UINTn; samples are still passed biased to signed
+};
 
-// IEEE Float (.off, "OFRX") encoders (src/core/optimfrog_encoder_float.cpp).
-bool ofr_encode_mono_float(const float* samples, uint32_t n, uint32_t samplerate, std::vector<uint8_t>& file,
-                            const std::vector<uint8_t>& head = {}, const std::vector<uint8_t>& tail = {});
-bool ofr_encode_stereo_float(const float* samples, uint32_t frames, uint32_t samplerate, std::vector<uint8_t>& file,
-                              const std::vector<uint8_t>& head = {}, const std::vector<uint8_t>& tail = {});
+// public encoder entry points. samples are interleaved, sign-extended to 32 bits. head/tail are
+// opaque bytes embedded verbatim in the HEAD/TAIL container blocks (--headersize/--tailsize
+// equivalents), restored bit-exact around the decoded PCM at decode time.
+bool ofr_encode(const int32_t* samples, uint64_t frames, int channels, uint32_t samplerate, int bps,
+                const OFR_EncodeParams& params, std::vector<uint8_t>& file,
+                const std::vector<uint8_t>& head = {}, const std::vector<uint8_t>& tail = {});
+
+// IEEE Float (.off, "OFRX")
+bool ofr_encode_float(const float* samples, uint64_t frames, int channels, uint32_t samplerate,
+                      const OFR_EncodeParams& params, std::vector<uint8_t>& file,
+                      const std::vector<uint8_t>& head = {}, const std::vector<uint8_t>& tail = {});
+
+// the pieces shared by the integer and the float encoder
+struct OFR_EncodedBlock { std::vector<uint8_t> comp, deta; };
+OFR_EncodedBlock ofr_encode_comp_block(const int32_t* samples, uint32_t frames, int channels, int bps,
+                                       uint8_t sample_type, const OFR_EncodeParams& params);
+void ofr_assemble_file(bool is_float, uint64_t total_values, uint8_t sample_type, int channels, uint32_t samplerate,
+                       const std::vector<OFR_EncodedBlock>& blocks, std::vector<uint8_t>& file,
+                       const std::vector<uint8_t>& head, const std::vector<uint8_t>& tail);
+uint32_t ofr_effective_block_frames(const OFR_EncodeParams& params, uint64_t frames, int channels);
+// runs job(0..count-1) on up to `threads` threads, each with the default FP environment
+void ofr_parallel_for(size_t count, uint32_t threads, const std::function<void(size_t)>& job);
+void ofr_put32(std::vector<uint8_t>& o, uint32_t v);
 
 // range encoder: exact dual of OFR_RangeCoder (decoder). 31-bit window to match the
 // decoder's post-init range of 0x80000000 (7-bit init + byte renorm at 0x800001).

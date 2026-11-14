@@ -8,31 +8,13 @@
 // self-consistent, same philosophy as the rest of this project's encoder (see
 // optimfrog_encoder.cpp). Verified interoperable with the real off binary's decoder.
 #include "../../include/optimfrog_encoder.h"
-#include <cstring>
 #include <algorithm>
-#include <string>
-
-static uint32_t crc32_table_f[256];
-static void crc32_init_f() {
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        crc32_table_f[i] = c;
-    }
-}
-static uint32_t crc32_calc_f(const uint8_t* p, size_t n) {
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; i++) c = crc32_table_f[(c ^ p[i]) & 0xff] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
-static void put32f(std::vector<uint8_t>& o, uint32_t v) {
-    o.push_back((uint8_t)v); o.push_back((uint8_t)(v>>8)); o.push_back((uint8_t)(v>>16)); o.push_back((uint8_t)(v>>24));
-}
+#include <cstring>
 
 struct FloatBlockStats { int32_t minExp, maxExp; };
 
-// per-block signed-exponent min/max, excluding zero/inf-nan/extreme-denormal-floor samples --
-// mirrors the exclusions in the reference's own per-block stats scan.
+// per-block signed-exponent min/max, excluding zero and inf/nan samples. subnormals count with
+// their normalized exponent, down to -149.
 static FloatBlockStats compute_block_stats(const float* samples, uint32_t n) {
     int32_t minExp = 0x7fffffff, maxExp = -0x7fffffff - 1;
     bool any = false;
@@ -46,7 +28,6 @@ static FloatBlockStats compute_block_stats(const float* samples, uint32_t n) {
             if (mant == 0) continue; // true zero
             uint32_t m = mant; e = -126;
             while (!(m & 0x800000u)) { m <<= 1; e--; }
-            if (e == -150) continue; // extreme denormal floor
         } else {
             e = (int32_t)biased - 127;
         }
@@ -85,8 +66,8 @@ static int32_t float_to_output(float f, int32_t iVar3, int32_t local_60, int32_t
         } else {
             uint32_t m = mant; int32_t e = -126;
             while (!(m & 0x800000u)) { m <<= 1; e--; }
-            if (e == -150) { is_true_zero = true; }
-            else { exp_i = e; frac = m & 0x7fffffu; }
+            exp_i = e;
+            frac = m & 0x7fffffu;
         }
     } else {
         exp_i = (int32_t)biased_exp - 127;
@@ -128,10 +109,9 @@ static int32_t float_to_output(float f, int32_t iVar3, int32_t local_60, int32_t
     }
 }
 
-// Encodes samples[0..n) (mono) or interleaved L/R (stereo, n = frames*2) into the DETA byte
-// stream + the OUTPUT integer array fed to the existing lossless encoder. Shared by both
-// ofr_encode_mono_float/ofr_encode_stereo_float since the DETA header/contexts aren't
-// per-channel (matches how the decoder processes the interleaved array uniformly).
+// Encodes one block of n interleaved values into the DETA byte stream + the OUTPUT integer array
+// fed to the lossless encoder. The DETA header and contexts aren't per-channel, matching how the
+// decoder processes the interleaved array uniformly.
 static void build_deta_and_output(const float* samples, uint32_t n, std::vector<uint8_t>& deta,
                                    std::vector<int32_t>& output) {
     FloatBlockStats st = compute_block_stats(samples, n);
@@ -162,89 +142,33 @@ static void build_deta_and_output(const float* samples, uint32_t n, std::vector<
     deta_enc.out[0] = 0x40;
 
     deta.clear();
-    deta.push_back('D'); deta.push_back('E'); deta.push_back('T'); deta.push_back('A');
-    uint32_t payload_len = (uint32_t)deta_enc.out.size();
-    put32f(deta, payload_len + 4);
-    uint32_t crc = crc32_calc_f(deta_enc.out.data(), deta_enc.out.size());
-    put32f(deta, crc);
+    ofr_put32(deta, OFR_TAG_DETA);
+    ofr_put32(deta, (uint32_t)deta_enc.out.size() + 4);
+    ofr_put32(deta, ofr_crc32(deta_enc.out.data(), deta_enc.out.size()));
     deta.insert(deta.end(), deta_enc.out.begin(), deta_enc.out.end());
 }
 
-// Patches a plain "OFR "-magic file produced by the existing lossless encoder into an
-// "OFRX" float file: swaps the magic + both sample_type bytes (main header and COMP payload,
-// SINT32=7 -> FLOAT32_1=8), splices the DETA sub-block right after COMP (before TAIL), and
-// substitutes the real head/tail bytes for the empty placeholders used when calling the
-// lossless encoder.
-static bool splice_float_file(std::vector<uint8_t>& inner, const std::vector<uint8_t>& deta,
-                               const std::vector<uint8_t>& head, const std::vector<uint8_t>& tail,
-                               std::vector<uint8_t>& file) {
-    if (inner.size() < 15) return false;
-    inner[3] = 'X';
-    inner[14] = 8; // main header sample_type
+bool ofr_encode_float(const float* samples, uint64_t frames, int channels, uint32_t samplerate,
+                      const OFR_EncodeParams& params, std::vector<uint8_t>& file,
+                      const std::vector<uint8_t>& head, const std::vector<uint8_t>& tail) {
+    if (channels != 1 && channels != 2) return false;
 
-    size_t comp_pos = std::string::npos;
-    for (size_t i = 0; i + 4 <= inner.size(); i++) {
-        if (inner[i] == 'C' && inner[i+1] == 'O' && inner[i+2] == 'M' && inner[i+3] == 'P') { comp_pos = i; break; }
-    }
-    if (comp_pos == std::string::npos) return false;
-    uint32_t D; memcpy(&D, &inner[comp_pos + 4], 4);
-    size_t payload_start = comp_pos + 12; // COMP(4) + D(4) + CRC(4)
-    size_t sampletype_off = payload_start + 4; // numSamples(4) then sampleType(1)
-    if (sampletype_off >= inner.size()) return false;
-    inner[sampletype_off] = 8; // COMP payload's own sample_type byte
+    const uint32_t per_block = ofr_effective_block_frames(params, frames, channels);
+    const size_t block_count = frames ? (size_t)((frames + per_block - 1) / per_block) : 1;
+    std::vector<OFR_EncodedBlock> blocks(block_count);
 
-    // patching that byte invalidates COMP's own CRC32 (covers everything from payload_start
-    // onward, D-4 bytes) -- recompute and overwrite it in place.
-    uint32_t new_crc = crc32_calc_f(&inner[payload_start], D - 4);
-    memcpy(&inner[comp_pos + 8], &new_crc, 4);
+    ofr_parallel_for(block_count, params.threads, [&](size_t i) {
+        uint64_t first = (uint64_t)i * per_block;
+        uint32_t n = (uint32_t)std::min<uint64_t>(per_block, frames - first);
 
-    size_t tail_pos = std::string::npos;
-    for (size_t i = comp_pos; i + 4 <= inner.size(); i++) {
-        if (inner[i] == 'T' && inner[i+1] == 'A' && inner[i+2] == 'I' && inner[i+3] == 'L') { tail_pos = i; break; }
-    }
-    if (tail_pos == std::string::npos) return false;
+        std::vector<uint8_t> deta;
+        std::vector<int32_t> output;
+        build_deta_and_output(samples + first * (uint64_t)channels, n * (uint32_t)channels, deta, output);
 
-    size_t head_pos = std::string::npos;
-    for (size_t i = 0; i + 4 <= comp_pos; i++) {
-        if (inner[i] == 'H' && inner[i+1] == 'E' && inner[i+2] == 'A' && inner[i+3] == 'D') { head_pos = i; break; }
-    }
-    if (head_pos == std::string::npos) return false;
-    uint32_t headSize; memcpy(&headSize, &inner[head_pos + 4], 4);
+        blocks[i] = ofr_encode_comp_block(output.data(), n, channels, 32, OFR_SAMPLE_FLOAT32, params);
+        blocks[i].deta = std::move(deta);
+    });
 
-    file.clear();
-    file.insert(file.end(), inner.begin(), inner.begin() + head_pos + 8); // up through HEAD's size field (0)
-    file.insert(file.end(), head.begin(), head.end());
-    file.insert(file.end(), inner.begin() + head_pos + 8 + headSize, inner.begin() + tail_pos); // COMP block
-    file.insert(file.end(), deta.begin(), deta.end());
-    file.push_back('T'); file.push_back('A'); file.push_back('I'); file.push_back('L');
-    put32f(file, (uint32_t)tail.size());
-    file.insert(file.end(), tail.begin(), tail.end());
+    ofr_assemble_file(true, frames * (uint64_t)channels, OFR_SAMPLE_FLOAT32, channels, samplerate, blocks, file, head, tail);
     return true;
-}
-
-bool ofr_encode_mono_float(const float* samples, uint32_t n, uint32_t samplerate, std::vector<uint8_t>& file,
-                            const std::vector<uint8_t>& head, const std::vector<uint8_t>& tail) {
-    crc32_init_f();
-    std::vector<uint8_t> deta;
-    std::vector<int32_t> output;
-    build_deta_and_output(samples, n, deta, output);
-
-    std::vector<uint8_t> inner;
-    if (!ofr_encode_mono(output.data(), n, samplerate, 32, inner, {}, {})) return false;
-    return splice_float_file(inner, deta, head, tail, file);
-}
-
-bool ofr_encode_stereo_float(const float* samples, uint32_t frames, uint32_t samplerate, std::vector<uint8_t>& file,
-                              const std::vector<uint8_t>& head, const std::vector<uint8_t>& tail) {
-    crc32_init_f();
-    std::vector<uint8_t> deta;
-    std::vector<int32_t> output;
-    build_deta_and_output(samples, (uint32_t)frames * 2, deta, output);
-
-    std::vector<uint8_t> inner;
-    if (!ofr_encode_stereo(output.data(), frames, samplerate, 32, inner, {}, {})) return false;
-
-    // ofr_encode_stereo's channelConfig byte differs from mono's (1 vs 0); splice_float_file
-    // patches the shared magic/sample_type/DETA-insertion logic identically for both.
-    return splice_float_file(inner, deta, head, tail, file);
 }

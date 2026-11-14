@@ -83,9 +83,11 @@ uint32_t int_bitlen(uint32_t v) {  // (1<x)+ladder, matches escape's bit count o
 }
 } // namespace
 
-void OFR_EntropyAcm::init(OFR_RangeCoder* rc, uint32_t bd, uint32_t ch, uint32_t total) {
-    bit_depth = bd; channels = ch; total_samples = total;
-    chans.assign(ch, Chan());
+void OFR_EntropyAcm::init(OFR_RangeCoder* rc, uint32_t bd, uint32_t ch) {
+    if (bd > 32) throw OFR_StreamError("entropy bit depth out of range");
+    bit_depth = bd; channels = ch;
+    // the channel state outlives the block, like the reference's
+    if (chans.size() < ch) chans.resize(ch);
     for (uint32_t cidx = 0; cidx < ch; ++cidx) {
         Chan& c = chans[cidx];
         c.msb_flag = uni(rc, 2) != 0;                     // +0x08
@@ -103,14 +105,6 @@ void OFR_EntropyAcm::init(OFR_RangeCoder* rc, uint32_t bd, uint32_t ch, uint32_t
             t_k = rc->read_uniform_bits(8) + 1;
             t_nsym = uni(rc, 0x80) + 2;
         }
-
-        c.vmap.assign(bit_depth, 0);
-        // worst case: one new context per exponent
-        c.vctx.assign(bit_depth, Ctx());
-        c.k.assign(bit_depth, 0);
-        c.nsym.assign(bit_depth, 0);
-        c.transform.assign(bit_depth, 0);
-        c.scale.assign(bit_depth, 0);
 
         int cur = -1;
         for (uint32_t e = 0; e < bit_depth; ++e) {
@@ -139,7 +133,6 @@ void OFR_EntropyAcm::init(OFR_RangeCoder* rc, uint32_t bd, uint32_t ch, uint32_t
         c.countdown = 0;
         c.state = 0;
     }
-    needs_init = false;
 }
 
 uint32_t OFR_EntropyAcm::decode_sample(Chan& c, OFR_RangeCoder* rc) {
@@ -163,6 +156,9 @@ uint32_t OFR_EntropyAcm::decode_sample(Chan& c, OFR_RangeCoder* rc) {
     int64_t mag = c.hist[state];
     if (c.msb_flag && state != 0 && c.hist[state - 1] > mag) mag = c.hist[state - 1];
     uint32_t e = mag_exp(mag);
+    // e is at most 31. the reference never checks it against the bit depth, and a damaged stream can
+    // land on an entry this block didn't write. a negative entry would crash it outright
+    if (c.vmap[e] < 0) throw OFR_StreamError("no entropy context for this magnitude");
     int ctx = c.vmap[e];
     uint32_t k = c.k[ctx];
     uint32_t pred = (uint32_t)(((uint64_t)k * (uint64_t)mag) >> 24) + 1u;
@@ -173,19 +169,12 @@ uint32_t OFR_EntropyAcm::decode_sample(Chan& c, OFR_RangeCoder* rc) {
         // escape
         uint32_t v = sym2 * pred;
         uint32_t bits = int_bitlen(v);
-        // guard mirrors the ent=2 escape check: bits must stay below bit_depth or
-        // `bit_depth - bits` underflows (uint32_t) and the range coder locks up.
-        // Real audio never hits this (bit_depth is always comfortably larger than
-        // the escape bit count); only pathological near-constant tiny-amplitude
-        // synthetic signals with a very small derived bit_depth can.
-        if (bits >= bit_depth) {
-            value = 0;
-        } else {
-            uint32_t rem = bit_depth - bits;
-            uint32_t idx = uni(rc, rem);
-            uint32_t low = rc->read_uniform_bits(idx + bits);
-            value = (1u << (idx + bits)) + low;
-        }
+        // the reference raises a block error here, as for an ent=2 escape
+        if (bits >= bit_depth) throw OFR_StreamError("entropy escape exceeds the bit depth");
+        uint32_t rem = bit_depth - bits;
+        uint32_t idx = uni(rc, rem);
+        uint32_t low = rc->read_uniform_bits(idx + bits);
+        value = (1u << (idx + bits)) + low;
     } else {
         uint32_t residual;
         if (pred < 0x4001u) {

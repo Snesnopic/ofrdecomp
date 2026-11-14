@@ -1,31 +1,49 @@
-// ofrenc CLI: encode raw PCM to a lossless .ofr file via the public ofr_encode_mono/stereo API.
-#include "../../include/optimfrog_decoder.h"
+// ofrenc: test-harness encoder with positional arguments, tuned through OFR_* environment
+// variables. the interactive tool is `ofr`; the conformance suite drives this one.
 #include "../../include/optimfrog_encoder.h"
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <exception>
-#include <iostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
-// setenv is POSIX-only; MSVC has no equivalent besides _putenv_s.
-static inline void ofr_setenv(const char* name, const char* value) {
-#if defined(_WIN32)
-    _putenv_s(name, value);
-#else
-    setenv(name, value, 1);
-#endif
+static OFR_EncodeParams params_from_env() {
+    OFR_EncodeParams p;
+    auto env_int = [](const char* name, auto& field) {
+        if (const char* v = getenv(name)) field = (std::remove_reference_t<decltype(field)>)atoi(v);
+    };
+    env_int("OFR_PRED", p.pred);
+    env_int("OFR_ENT", p.ent);
+    env_int("OFR_ORDER", p.mono_order);
+    env_int("OFR_INTERVAL", p.mono_interval);
+    env_int("OFR_ODIDX", p.stereo_order_idx);
+    env_int("OFR_IVIDX", p.stereo_interval_idx);
+    env_int("OFR_WPRED", p.pred_weight);
+    env_int("OFR_WENT", p.ent_weight);
+    env_int("OFR_BLOCK", p.block_frames);
+    env_int("OFR_THREADS", p.threads);
+    p.search = getenv("OFR_BEST") != nullptr;
+    return p;
 }
 
-static void enc_one(const std::vector<int32_t>& s, uint32_t nvals, uint32_t rate, int ch, int bps, std::vector<uint8_t>& out) {
-    if (ch == 2) ofr_encode_stereo(s.data(), nvals / 2, rate, bps, out);
-    else ofr_encode_mono(s.data(), nvals, rate, bps, out);
+static bool read_file(const char* path, std::vector<uint8_t>& data) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    data.clear();
+    std::vector<uint8_t> chunk(1u << 20);
+    size_t got;
+    while ((got = fread(chunk.data(), 1, chunk.size(), f)) > 0) data.insert(data.end(), chunk.begin(), chunk.begin() + (std::ptrdiff_t)got);
+    bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
 }
 
 static int run(int argc, char** argv) {
     // --float: encode a raw float32 PCM file (IEEE Float / "OFRX") instead of integer PCM.
-    // Consumes one positional slot less (no bps arg, always 32-bit float samples).
     bool want_float = false;
     std::vector<char*> pos;
     for (int i = 1; i < argc; i++) {
@@ -38,75 +56,36 @@ static int run(int argc, char** argv) {
     }
     int ch = (pos.size() >= 4) ? atoi(pos[3]) : 1;
     uint32_t rate = (uint32_t)atoi(pos[2]);
+    int bps = want_float ? 32 : (pos.size() >= 5) ? atoi(pos[4]) : 16;
+    OFR_EncodeParams params = params_from_env();
 
-    if (want_float) {
-        FILE* f = fopen(pos[0], "rb");
-        if (!f) { perror("in"); return 1; }
-        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-        std::vector<float> s(sz / 4);
-        fread(s.data(), 4, s.size(), f); fclose(f);
-
-        std::vector<uint8_t> out;
-        bool ok = (ch == 2) ? ofr_encode_stereo_float(s.data(), (uint32_t)(s.size() / 2), rate, out)
-                             : ofr_encode_mono_float(s.data(), (uint32_t)s.size(), rate, out);
-        if (!ok) { fprintf(stderr, "float encode failed\n"); return 1; }
-        FILE* g = fopen(pos[1], "wb");
-        if (!g) { perror("out"); return 1; }
-        fwrite(out.data(), 1, out.size(), g); fclose(g);
-        fprintf(stderr, "wrote %zu bytes (ch=%d, float32)\n", out.size(), ch);
-        return 0;
-    }
-
-    int bps = (pos.size() >= 5) ? atoi(pos[4]) : 16;
-    int bytes = bps / 8;
-    FILE* f = fopen(pos[0], "rb");
-    if (!f) { perror("in"); return 1; }
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> raw(sz);
-    fread(raw.data(), 1, sz, f); fclose(f);
-    uint32_t nvals = (uint32_t)(sz / bytes);
-    std::vector<int32_t> s(nvals);
-    for (uint32_t i = 0; i < nvals; i++) {
-        const uint8_t* p = &raw[(size_t)i * bytes];
-        int32_t v = 0;
-        for (int b = 0; b < bytes; b++) v |= (int32_t)p[b] << (8 * b);
-        int shleft = 32 - bps; v = (v << shleft) >> shleft;
-        s[i] = v;
-    }
+    std::vector<uint8_t> raw;
+    if (!read_file(pos[0], raw)) { perror("in"); return 1; }
 
     std::vector<uint8_t> out;
-    if (getenv("OFR_BEST")) {
-        // search a small set of safe configs, keep the smallest (all paths are verified lossless)
-        std::vector<uint8_t> best;
-        std::string best_desc;
-        auto setenvi = [](const char* k, int v){ char b[16]; snprintf(b,16,"%d",v); ofr_setenv(k,b); };
-        // pred=1 orders (mono up to 96 safe; stereo via od_idx 0/1) x ent 1/2/3, plus pred=3 x ent
-        int mono_orders[] = {24, 64, 96};
-        int st_odidx[]    = {0, 1};
-        for (int ent = 1; ent <= 3; ++ent) {
-            setenvi("OFR_ENT", ent);
-            // pred=1
-            setenvi("OFR_PRED", 1);
-            if (ch == 2) {
-                for (int oi : st_odidx) { setenvi("OFR_ODIDX", oi); std::vector<uint8_t> o; enc_one(s,nvals,rate,ch,bps,o);
-                    if (best.empty() || o.size() < best.size()) { best = o; best_desc = "pred1 ent"+std::to_string(ent)+" odidx"+std::to_string(oi); } }
-            } else {
-                for (int od : mono_orders) { setenvi("OFR_ORDER", od); std::vector<uint8_t> o; enc_one(s,nvals,rate,ch,bps,o);
-                    if (best.empty() || o.size() < best.size()) { best = o; best_desc = "pred1 ent"+std::to_string(ent)+" order"+std::to_string(od); } }
-            }
-            // pred=3 (fixed cascade params)
-            setenvi("OFR_PRED", 3);
-            { std::vector<uint8_t> o; enc_one(s,nvals,rate,ch,bps,o);
-              if (best.empty() || o.size() < best.size()) { best = o; best_desc = "pred3 ent"+std::to_string(ent); } }
-        }
-        out = best;
-        fprintf(stderr, "best: %s\n", best_desc.c_str());
+    bool ok;
+    if (want_float) {
+        std::vector<float> s(raw.size() / 4);
+        if (!s.empty()) memcpy(s.data(), raw.data(), s.size() * 4);
+        ok = ofr_encode_float(s.data(), s.size() / (size_t)ch, ch, rate, params, out);
     } else {
-        enc_one(s, nvals, rate, ch, bps, out);
+        int bytes = bps / 8;
+        if (bytes < 1 || bytes > 4) { fprintf(stderr, "unsupported bit depth\n"); return 2; }
+        std::vector<int32_t> s(raw.size() / (size_t)bytes);
+        for (size_t i = 0; i < s.size(); i++) {
+            uint32_t v = 0;
+            for (int b = 0; b < bytes; b++) v |= (uint32_t)raw[i * (size_t)bytes + (size_t)b] << (8 * b);
+            int shleft = 32 - bps;
+            s[i] = (int32_t)(v << shleft) >> shleft;
+        }
+        ok = ofr_encode(s.data(), s.size() / (size_t)ch, ch, rate, bps, params, out);
     }
+    if (!ok) { fprintf(stderr, "invalid encoder parameters\n"); return 1; }
+
     FILE* g = fopen(pos[1], "wb");
     if (!g) { perror("out"); return 1; }
-    fwrite(out.data(), 1, out.size(), g); fclose(g);
+    fwrite(out.data(), 1, out.size(), g);
+    fclose(g);
     fprintf(stderr, "wrote %zu bytes (ch=%d bps=%d)\n", out.size(), ch, bps);
     return 0;
 }
@@ -115,7 +94,7 @@ int main(int argc, char** argv) {
     try {
         return run(argc, argv);
     } catch (const std::exception& e) {
-        std::cerr << "Fatal error: " << e.what() << std::endl;
+        fprintf(stderr, "Fatal error: %s\n", e.what());
         return 1;
     }
 }

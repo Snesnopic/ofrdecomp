@@ -19,8 +19,9 @@ static int run(int argc, char** argv) {
         return 1;
     }
     
-    if (OptimFROG_open(instance, argv[1]) != OptimFROG_NoError) {
+    if (!OptimFROG_open(instance, argv[1])) {
         std::cerr << "Failed to open file: " << argv[1] << std::endl;
+        OptimFROG_destroyInstance(instance);
         return 1;
     }
     
@@ -30,7 +31,7 @@ static int run(int argc, char** argv) {
         std::cout << "Sample Rate: " << info.samplerate << " Hz" << std::endl;
         std::cout << "Channels: " << info.channels << std::endl;
         std::cout << "Bit Depth: " << info.bitspersample << " bits" << std::endl;
-        std::cout << "Total Samples: " << (info.length_ms * info.samplerate / 1000) << std::endl;
+        std::cout << "Total Samples: " << info.noPoints << std::endl;
     }
     
     std::cout << "Attempting to decode..." << std::endl;
@@ -50,8 +51,9 @@ static int run(int argc, char** argv) {
     if (out_f) fclose(out_f);
     std::cout << "Decoded " << total_read << " samples." << std::endl;
     
+    bool damaged = OptimFROG_recoverableErrors(instance) != C_FALSE;
     OptimFROG_destroyInstance(instance);
-    return 0;
+    return damaged ? 1 : 0;
 }
 
 int main(int argc, char** argv) {

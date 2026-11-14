@@ -1,0 +1,39 @@
+name: Sanitizers
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  sanitizers:
+    name: ASan + UBSan + LSan, fuzz smoke test (Linux, clang)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure CMake
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          flags="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DOFRDECOMP_FUZZ=ON \
+              -DCMAKE_CXX_FLAGS="$flags" -DCMAKE_EXE_LINKER_FLAGS="$flags"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Fuzz the decoder for two minutes
+        run: |
+          mkdir corpus
+          build/make_corpus corpus
+          build/fuzz_decoder corpus -max_total_time=120 -max_len=32768 -timeout=20 -rss_limit_mb=3000 -malloc_limit_mb=1024

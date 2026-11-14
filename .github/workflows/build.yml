@@ -90,6 +90,10 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Test
+        if: '!matrix.skip_sanity_check'
+        run: ctest --test-dir build -C Release --output-on-failure
+
       - name: Decode sanity check (sine_mono / test_stereo, MD5 known-good)
         if: '!matrix.skip_sanity_check'
         shell: bash
@@ -140,10 +144,12 @@ jobs:
           usesh: true
           arch: ${{ matrix.arch }}
           release: ${{ matrix.release }}
-          prepare: pkg install -y cmake git
+          prepare: pkg install -y cmake git python3 bash
+          # the arm64 VM is emulated, far too slow for the test suite
           run: |
             cmake -B build -DCMAKE_BUILD_TYPE=Release
             cmake --build build --config Release
+            if [ "${{ matrix.arch }}" = x86_64 ]; then ctest --test-dir build --output-on-failure; fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v7

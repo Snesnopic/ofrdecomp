@@ -1,464 +1,590 @@
 #include "../../include/optimfrog_decoder.h"
-#include <cstring>
-#include <stdexcept>
 #include <algorithm>
-#include <vector>
+#include <cstring>
+#include <new>
 
-// FUN_00018d80: bit-length of the data range (min,max) → entropy bit depth / shift source
-static int ofr_bitlen(int mn, int mx) {
-    uint32_t a = (uint32_t)((mn >> 31) ^ mn);
-    uint32_t b = (uint32_t)((mx >> 31) ^ mx);
-    if (a == 0 && b == 0) return 1;
-    uint32_t m = ((int)b <= (int)a) ? a : b;
-    uint32_t u = (m < 0x10000u) ? m : (m >> 16);
-    uint32_t bits = (m > 0xffffu) ? 16u : 0u;
-    if (u > 0xffu) { u >>= 8; bits += 8; }
-    if (u > 0xfu)  { u >>= 4; bits += 4; }
-    if (u > 3u)    { u >>= 2; bits += 2; }
-    return (int)(bits + 2u + (u > 1u ? 1u : 0u));
+namespace {
+
+constexpr size_t READ_BUFFER = 1u << 16;
+constexpr uint32_t MAGIC_SCAN_LIMIT = 0x100000;   // self-extracting files carry a stub in front
+constexpr uint32_t MAX_DECODER_VERSION = 5100;
+
+uint32_t le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-// FUN_00016f10 (post=1 coded-range reduction): faithful port. The reference picks between
-// two precisions depending on whether min/max fit a safe +-2^23 range:
-//   - narrow: 32-bit division, mult used as its native SIGNED int32 value.
-//   - wide:   64-bit division, mult zero-extended to an UNSIGNED 64-bit value.
-// (The final value*mult+offset reconstruction is insensitive to this distinction --
-// value*mult and value*(mult+2^32) are congruent mod 2^32, and the result is always
-// truncated back to int32 -- but the DIVISION here is not, so getting this wrong silently
-// produces a different quotient whenever the truncated-mod-2^32 coincidence doesn't hold.)
-// Both paths apply a floor adjustment to the min result (quotient -1 when the remainder is
-// negative) and a ceil adjustment to the max result (quotient +1 when the remainder is
-// positive), matching the exact `sarl $0x1f; addl` / `test; jle; incl` sequences in the binary.
-static void ofr_reduce_range(int min_val, int max_val, int offset, int mult, int& out_min, int& out_max) {
-    bool wide = (min_val < -0x800000) || (max_val >= 0x800000);
-    if (wide) {
-        int64_t divisor = (int64_t)(uint32_t)mult;  // zero-extend
-        int64_t a_min = (int64_t)min_val - (int64_t)offset;
-        int64_t q_min = a_min / divisor, r_min = a_min % divisor;
-        out_min = (int32_t)(q_min + (r_min < 0 ? -1 : 0));
-        int64_t a_max = (int64_t)max_val - (int64_t)offset;
-        int64_t q_max = a_max / divisor, r_max = a_max % divisor;
-        out_max = (int32_t)(r_max > 0 ? q_max + 1 : q_max);
-    } else {
-        int32_t divisor = mult;  // native signed
-        int32_t a_min = min_val - offset;
-        int32_t q_min = a_min / divisor, r_min = a_min % divisor;
-        out_min = q_min + (r_min < 0 ? -1 : 0);
-        int32_t a_max = max_val - offset;
-        int32_t q_max = a_max / divisor, r_max = a_max % divisor;
-        out_max = (r_max > 0 ? q_max + 1 : q_max);
+} // namespace
+
+OFR_BitStream::OFR_BitStream(ReadInterface* rInt, void* readerInstance)
+    : rInt_(rInt), inst_(readerInstance), buffer_(READ_BUFFER) {
+    if (seekable()) {
+        sInt64_t p = rInt_->getPos(inst_);
+        pos_ = p > 0 ? (uint64_t)p : 0;
     }
 }
 
-OFR_DecoderEngine::~OFR_DecoderEngine() {}
-
-
-
-void OFR_RangeCoder::normalize() {
-    OFR_BitStream* bs = (OFR_BitStream*)this->bs_ptr;
-    while (range < 0x800001) {
-        value = ((cache & 1) << 7) | (value << 8);
-        cache = bs->readU8();
-        value |= (cache >> 1);
-        range <<= 8;
-    }
-}
-
-void OFR_RangeCoder::init(void* bitstream) {
-    this->bs_ptr = bitstream;
-    OFR_BitStream* bs = (OFR_BitStream*)bitstream;
-    
-    // FUN_0011a450 consumes 2 bytes. The first is uVar1 (returned but ignored).
-    bs->readU8(); 
-    
-    // The second is bVar2, which goes into cache.
-    this->cache = bs->readU8();
-    this->range = 0x80;
-    this->value = this->cache >> 1;
-    
-    // Automatically read bits until range >= 0x800001
-    this->normalize();
-    
-}
-
-
-
-
-bool OFR_DecoderEngine::open(ReadInterfaceWrapper* wrapper) {
-    this->bitstream = new OFR_BitStream(wrapper);
-    OFR_BitStream* bs = this->bitstream;
-    
-    uint32_t magic = 0;
-    magic = bs->readU32();
-    
-    int limit = 0x100000;
-    while (limit > 0) {
-        if (magic == 0x2052464f || magic == 0x5852464f) break; // 'OFR ' or 'OFRX' (IEEE float)
-        magic = (magic >> 8) | ((uint32_t)bs->readU8() << 24);
-        limit--;
-    }
-    this->is_float = (magic == 0x5852464f);
-    
-    uint32_t size = bs->readU32();
-    
-    uint32_t ts_low = bs->readU32();
-    uint16_t ts_high = bs->readU16();
-    this->total_samples = ((uint64_t)ts_high << 32) | ts_low;
-    
-    this->sample_type = bs->readU8();
-    this->channelConfig = bs->readU8();
-    this->samplerate = bs->readU32();
-    
-    uint16_t val1 = bs->readU16();
-    uint8_t val2 = bs->readU8();
-    
-    this->version = (val1 >> 4) + 0x1194;
-    this->pad2 = val1 & 0xf;
-    this->speedup = val2 & 7;
-    this->method = val2 >> 3;
-    
-    uint32_t bytesRead = 0xf;
-    if (size >= 0x11) {
-        bs->readU16(); // extra_version, not used according to decomp, just skipped
-        bytesRead = 0x11;
-    }
-    
-    // bitspersample mapped from sample_type
-    if (this->sample_type == 0 || this->sample_type == 1) this->bitspersample = 8;
-    else if (this->sample_type == 2 || this->sample_type == 3) this->bitspersample = 16;
-    else if (this->sample_type == 4 || this->sample_type == 5) this->bitspersample = 24;
-    else if (this->sample_type == 6 || this->sample_type == 7) this->bitspersample = 32;
-    else if (this->sample_type == 8 || this->sample_type == 9 || this->sample_type == 10) this->bitspersample = 32; // FLOAT32_*
-    else this->bitspersample = 16; // fallback
-    
-    // channels mapped from channelConfig
-    if (this->channelConfig == 0) this->channels = 1;
-    else if (this->channelConfig == 1) this->channels = 2;
-    else this->channels = 2; // fallback
-    
-    // skip remaining header
-    if (size > bytesRead) {
-        uint32_t to_skip = size - bytesRead;
-        for(uint32_t i=0; i<to_skip; i++) bs->readU8();
-    }
-    
-    uint32_t headMagic = bs->readU32();
-    if (headMagic == 0x44414548) { // "HEAD"
-        this->headSize = bs->readU32();
-        if (this->headSize > 0) {
-            this->headData = new uint8_t[this->headSize];
-            bs->readBytes(this->headData, this->headSize);
+size_t OFR_BitStream::read(void* dst, size_t count) {
+    uint8_t* d = (uint8_t*)dst;
+    size_t done = 0;
+    while (done < count) {
+        if (buf_pos_ == buf_avail_) {
+            sInt32_t got = open_ ? rInt_->read(inst_, buffer_.data(), (uInt32_t)buffer_.size()) : 0;
+            buf_pos_ = 0;
+            buf_avail_ = got > 0 ? (size_t)got : 0;
+            if (buf_avail_ == 0) break;
         }
-
-        this->tailSize = 0;
-        this->has_recoverable_errors = false;
-        this->decode_buffer = new int32_t[1024 * 1024];
-        this->samples_read_so_far = 0;
-        this->need_new_block = true;
-        this->comp_start_offset = bs->tell();
-
-        return true;
+        size_t n = std::min(count - done, buf_avail_ - buf_pos_);
+        std::memcpy(d + done, buffer_.data() + buf_pos_, n);
+        buf_pos_ += n;
+        done += n;
     }
-    
-    return false;
+    pos_ += done;
+    return done;
 }
 
-
-uInt32_t OFR_DecoderEngine::block_decode(void* dest, uInt32_t count) {
-    uint32_t samples_to_decode = count * this->channels;
-    this->block_decoder.decode_block((uint32_t*)this->decode_buffer, samples_to_decode, &this->range_coder);
-
-    int32_t* dest32 = (int32_t*)dest;
-    int32_t* src32 = this->decode_buffer;
-    for (uint32_t i = 0; i < samples_to_decode; ++i) {
-        dest32[i] = src32[i];
-    }
-
-    return count;
+uint32_t OFR_BitStream::peek_tag() {
+    uint8_t b[4] = {0, 0, 0, 0};
+    read(b, 4);
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
 }
 
-uInt32_t OFR_DecoderEngine::read(void* dest, uInt32_t count) {
-    if (count == 0 || this->samples_read_so_far >= this->total_samples) {
-        return 0;
-    }
-
-    OFR_BitStream* bs = this->bitstream;
-
-    uint32_t read_so_far = 0;
-    do {
-        if (this->need_new_block) {
-            uint32_t comp_magic = bs->readU32();
-            if (comp_magic != 0x504d4f43) { // 'COMP'
-                this->has_recoverable_errors = true;
-                return read_so_far; 
-            }
-
-            uint32_t compressed_size = bs->readU32();
-            bs->readU32();  // skipped field, unused
-            uint32_t uncompressed_size = bs->readU32();
-            
-            bs->readU8();  // uVar8, unused
-            bs->readU8();  // bVar2, unused
-            uint16_t uVar15 = bs->readU16();
-            
-            
-            // Skip 1 byte (encoder ID low byte; the range stream's dummy b0 is the next byte)
-            bs->readU8();
-
-            // bound the range coder to this block's payload so it cannot over-read into the
-            // next COMP block. payload = D - 13 (CRC4+num4+type1+cfg1+reserved2+idbyte1 already read).
-            this->m_payload_len = (compressed_size >= 13) ? (compressed_size - 13) : 0;
-            this->m_payload_start = bs->tell();
-            bs->range_budget = (long)this->m_payload_len;
-
-            this->range_coder.init(bs);
-            this->block_error = false;
-
-            uint32_t entropy_type = uVar15 >> 11;
-            uint32_t post_type = uVar15 & 0x3f;
-            uint32_t pred_type = (uVar15 >> 6) & 0x1f;
-            uint32_t reduced_bit_depth = this->bitspersample;
-
-            // PostProcessor
-            if (post_type != 0) {
-                if (!this->block_decoder.post_processor) {
-                    this->block_decoder.post_processor = new OFR_PostProcessor();
-                }
-                if (post_type == 2) {
-                    this->block_decoder.post_processor->init2(&this->range_coder, this->channels, this->bitspersample);
-                } else {
-                    this->block_decoder.post_processor->init(&this->range_coder, reduced_bit_depth, this->channels);
-                }
-            }
-
-            // data bit-length (local_4c in FUN_00010870) drives predictor shift and entropy depth.
-            // For post=1 with a non-identity mult/offset (the reference factors a common
-            // multiplier out of the signal), the predictor/entropy operate on the *reduced*
-            // coded range (value-offset)/mult, NOT the stored original min/max.
-            int data_bits = 13;
-            if (post_type != 0) {
-                OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                int mnL = pp->min_val_L, mxL = pp->max_val_L;
-                int mnR = pp->min_val_R, mxR = pp->max_val_R;
-                if (post_type == 1) {
-                    ofr_reduce_range(pp->min_val_L, pp->max_val_L, pp->offset_L, pp->mult_L, mnL, mxL);
-                    if (this->channels == 2) {
-                        ofr_reduce_range(pp->min_val_R, pp->max_val_R, pp->offset_R, pp->mult_R, mnR, mxR);
-                    }
-                }
-                // Predictor/entropy clamp in the *reduced* coded space; keep min_val_L/max_val_L
-                // (and R) untouched at their original values, since OFR_PostProcessor::decode's
-                // final reconstruction (post_type==1) clamps the value*mult+offset result to the
-                // ORIGINAL range in 64-bit, before truncating to int32 -- essential whenever mult
-                // doesn't exactly divide every sample's distance from offset (e.g. a smooth/tonal
-                // signal that only approximately factors through a common multiplier).
-                pp->scaled_min_L = mnL; pp->scaled_max_L = mxL;
-                if (this->channels == 2) { pp->scaled_min_R = mnR; pp->scaled_max_R = mxR; }
-                if (this->channels == 2) {
-                    data_bits = ofr_bitlen(std::min(mnL, mnR), std::max(mxL, mxR));
-                } else {
-                    data_bits = ofr_bitlen(mnL, mxL);
-                }
-            }
-
-
-            // Predictor — dispatch on channels
-            if (pred_type == 1) {
-                if (this->channels == 1) {
-                    if (!this->block_decoder.predictor) {
-                        this->block_decoder.predictor = new OFR_Predictor();
-                    }
-                    OFR_Predictor* pd = this->block_decoder.predictor;
-                    pd->init(&this->range_coder, this->bitspersample);
-                    // FUN_00006f50: min/max/shift from post-processor
-                    if (post_type != 0) {
-                        OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                        pd->min_val = pp->scaled_min_L;
-                        pd->max_val = pp->scaled_max_L;
-                    }
-                    pd->shift = 32 - data_bits;
-                } else {
-                    if (!this->block_decoder.predictor_stereo) {
-                        this->block_decoder.predictor_stereo = new OFR_PredictorStereo();
-                    }
-                    OFR_PredictorStereo* ps = this->block_decoder.predictor_stereo;
-                    ps->init(&this->range_coder, this->bitspersample);
-                    ps->init_from_bitstream(&this->range_coder);
-                    // FUN_00007400: copy postproc min/max and shift into predictor
-                    OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                    ps->m_left_min  = pp->scaled_min_L;
-                    ps->m_left_max  = pp->scaled_max_L;
-                    ps->m_right_min = pp->scaled_min_R;
-                    ps->m_right_max = pp->scaled_max_R;
-                    ps->m_shift = 32u - (uint32_t)data_bits;
-                }
-            } else if (pred_type == 3 && this->channels == 1) {
-                if (!this->block_decoder.predictor_cascade_mono) {
-                    this->block_decoder.predictor_cascade_mono = new OFR_PredictorCascadeMono();
-                }
-                OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                int mn = pp ? pp->scaled_min_L : -0x800000;
-                int mx = pp ? pp->scaled_max_L : 0x7fffff;
-                this->block_decoder.predictor_cascade_mono->init(
-                    &this->range_coder, this->bitspersample, mn, mx, data_bits, (int)uncompressed_size);
-            } else if (pred_type == 3 && this->channels == 2) {
-                if (!this->block_decoder.predictor_cascade_stereo) {
-                    this->block_decoder.predictor_cascade_stereo = new OFR_PredictorCascadeStereo();
-                }
-                OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                this->block_decoder.predictor_cascade_stereo->init(
-                    &this->range_coder, this->bitspersample,
-                    pp->scaled_min_L, pp->scaled_max_L, pp->scaled_min_R, pp->scaled_max_R,
-                    data_bits, (int)uncompressed_size);
-            } else if (pred_type == 4 && this->channels == 1) {
-                if (!this->block_decoder.predictor_dualstream_mono) {
-                    this->block_decoder.predictor_dualstream_mono = new OFR_PredictorDualStreamMono();
-                }
-                OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                int mn = pp ? pp->scaled_min_L : -0x800000;
-                int mx = pp ? pp->scaled_max_L : 0x7fffff;
-                // Quantization can legitimately overshoot the source signal's exact min/max by a
-                // fraction of a step -- DualStream's own docs advertise "no clipping possible" as
-                // a design feature, unlike the lossless predictors (which by construction never
-                // exceed the true range). Widen post1's clamp bounds so it never fires here.
-                if (pp) { pp->min_val_L = -0x7fffffff; pp->max_val_L = 0x7fffffff; }
-                this->block_decoder.predictor_dualstream_mono->init(
-                    &this->range_coder, mn, mx, data_bits, (int)uncompressed_size);
-            } else if (pred_type == 4 && this->channels == 2) {
-                if (!this->block_decoder.predictor_dualstream_stereo) {
-                    this->block_decoder.predictor_dualstream_stereo = new OFR_PredictorDualStreamStereo();
-                }
-                OFR_PostProcessor* pp = this->block_decoder.post_processor;
-                int mnL = pp ? pp->scaled_min_L : -0x800000, mxL = pp ? pp->scaled_max_L : 0x7fffff;
-                int mnR = pp ? pp->scaled_min_R : -0x800000, mxR = pp ? pp->scaled_max_R : 0x7fffff;
-                // same "no clipping possible" rationale as the mono case above.
-                if (pp) {
-                    pp->min_val_L = -0x7fffffff; pp->max_val_L = 0x7fffffff;
-                    pp->min_val_R = -0x7fffffff; pp->max_val_R = 0x7fffffff;
-                }
-                this->block_decoder.predictor_dualstream_stereo->init(
-                    &this->range_coder, mnL, mxL, mnR, mxR, data_bits, (int)uncompressed_size);
-            }
-
-            // Entropy Coder
-            if (entropy_type == 3) {
-                if (!this->block_decoder.entropy_acm) {
-                    this->block_decoder.entropy_acm = new OFR_EntropyAcm();
-                }
-                this->block_decoder.entropy_acm->init(&this->range_coder,
-                    (uint32_t)data_bits, this->channels, uncompressed_size);
-            } else if (entropy_type != 0) {
-                if (!this->block_decoder.entropy) {
-                    this->block_decoder.entropy = new OFR_EntropyDecoder();
-                }
-                // entropy_type can change per block (the reference mixes ent=1/ent=2) — re-init each
-                // block so type/bit_depth/channels track the current block, then read its weight.
-                this->block_decoder.entropy->init((uint32_t)data_bits, this->channels, entropy_type, true);
-                this->block_decoder.entropy->init_from_bitstream(&this->range_coder);
-            }
-
-            this->block_size = uncompressed_size / this->channels;
-            this->block_pos = 0;
-            this->need_new_block = false;
-
-            // Float files: the "DETA" sub-block immediately follows this COMP block's on-disk
-            // payload and must be parsed sequentially right after it, so the whole block's worth
-            // of integers has to be decoded eagerly here (not incrementally per read() call like
-            // the lossless path) before any samples can be handed back to the caller.
-            if (this->is_float && !this->block_error) {
-                uint32_t total = this->block_size * this->channels;
-                this->block_decoder.decode_block((uint32_t*)this->decode_buffer, total, &this->range_coder);
-
-                bs->range_budget = -1;
-                uint32_t consumed = bs->tell() - this->m_payload_start;
-                for (uint32_t k = consumed; k < this->m_payload_len; ++k) bs->readU8();
-
-                this->reconstruct_float_block(this->decode_buffer, total);
-            }
-        }
-
-        uint32_t remaining_in_block = this->block_size - this->block_pos;
-        uint32_t to_read = count - read_so_far;
-        if (remaining_in_block < to_read) {
-            to_read = remaining_in_block;
-        }
-
-        // dest holds int32 interleaved samples; advance by frames*channels
-        int32_t* dest_ptr = (int32_t*)dest + (size_t)read_so_far * this->channels;
-
-        if (!this->block_error) {
-            if (this->is_float) {
-                memcpy(dest_ptr, this->decode_buffer + (size_t)this->block_pos * this->channels,
-                       (size_t)to_read * this->channels * sizeof(int32_t));
-            } else {
-                this->block_decode(dest_ptr, to_read);
-            }
-
-            if (!this->block_error) {
-                read_so_far += to_read;
-            } else {
-                memset(dest_ptr, 0, (size_t)to_read * this->channels * sizeof(int32_t));
-            }
-        } else {
-            memset(dest_ptr, 0, (size_t)to_read * this->channels * sizeof(int32_t));
-        }
-
-        this->block_pos += to_read;
-        this->samples_read_so_far += to_read;
-
-        if (this->block_pos == this->block_size) {
-            if (!this->is_float) {
-                // realign to the next COMP: skip any payload bytes the range coder didn't consume
-                // (it stops at/under the budget; the next COMP starts exactly at payload_start+payload_len).
-                bs->range_budget = -1;
-                uint32_t consumed = bs->tell() - this->m_payload_start;
-                for (uint32_t k = consumed; k < this->m_payload_len; ++k) bs->readU8();
-            }
-            this->need_new_block = true;
-        }
-
-    } while (read_so_far < count && this->samples_read_so_far < this->total_samples);
-
-    return read_so_far;
+void OFR_BitStream::read_exact(void* dst, size_t count) {
+    if (read(dst, count) != count) throw OFR_StreamError("unexpected end of stream");
 }
-bool OFR_DecoderEngine::seek(sInt64_t frame_pos) {
-    // frame_pos is a frame index (matches samples_read_so_far's unit -- see read()/block_decode,
-    // which advance it by frame counts, not by frames*channels).
-    sInt64_t total_frames = this->channels ? this->total_samples / this->channels : 0;
-    if (frame_pos < 0) frame_pos = 0;
-    if (frame_pos > total_frames) frame_pos = total_frames;
 
-    OFR_BitStream* bs = this->bitstream;
-    if (!bs || !bs->wrapper || !bs->wrapper->rInt->seekable(bs->wrapper->readerInstance)) return false;
-    if (!bs->seek(this->comp_start_offset)) return false;
-
-    this->need_new_block = true;
-    this->samples_read_so_far = 0;
-    this->has_recoverable_errors = false;
-
-    // Every COMP block is independently decodable (fresh predictor/entropy/post-processor
-    // init on each new-block transition), so seeking is just: rewind to the first COMP block,
-    // then decode-and-discard forward to the target frame via the normal read() path -- this
-    // reuses the exact same block-boundary/state-reset logic as a plain linear decode.
-    const uInt32_t CHUNK = 65536;
-    std::vector<int32_t> scratch((size_t)CHUNK * (this->channels ? this->channels : 1));
-    while (this->samples_read_so_far < frame_pos) {
-        sInt64_t remaining_frames = frame_pos - this->samples_read_so_far;
-        uInt32_t want_frames = (uInt32_t)std::min<sInt64_t>(CHUNK, remaining_frames);
-        uInt32_t got = this->read(scratch.data(), want_frames);
-        if (got == 0) break;
+size_t OFR_BitStream::read_append(std::vector<uint8_t>& dst, uint64_t count) {
+    size_t total = 0;
+    while (count > 0) {
+        size_t n = (size_t)std::min<uint64_t>(count, 1u << 20);
+        size_t base = dst.size();
+        dst.resize(base + n);
+        size_t got = read(dst.data() + base, n);
+        dst.resize(base + got);
+        total += got;
+        count -= got;
+        if (got < n) break;
     }
-    return this->samples_read_so_far == frame_pos;
+    return total;
 }
-bool OFR_DecoderEngine::readTail() {
-    OFR_BitStream* bs = this->bitstream;
-    uint32_t magic = bs->readU32();
-    if (magic != 0x4c494154) return false; // "TAIL"
-    this->tailSize = bs->readU32();
-    if (this->tailSize > 0) {
-        this->tailData = new uint8_t[this->tailSize];
-        bs->readBytes(this->tailData, this->tailSize);
+
+uint16_t OFR_BitStream::read_u16() {
+    uint8_t b[2];
+    read_exact(b, 2);
+    return (uint16_t)(b[0] | (b[1] << 8));
+}
+
+uint32_t OFR_BitStream::read_u32() {
+    uint8_t b[4];
+    read_exact(b, 4);
+    return le32(b);
+}
+
+bool OFR_BitStream::seek(uint64_t byte_pos) {
+    if (!open_ || !rInt_->seek(inst_, (sInt64_t)byte_pos)) return false;
+    buf_pos_ = 0;
+    buf_avail_ = 0;
+    pos_ = byte_pos;
+    return true;
+}
+
+bool OFR_BitStream::skip(uint64_t count) {
+    if (seekable()) return seek(pos_ + count);
+    uint8_t tmp[4096];
+    while (count > 0) {
+        size_t n = (size_t)std::min<uint64_t>(count, sizeof(tmp));
+        if (read(tmp, n) != n) return false;
+        count -= n;
     }
     return true;
 }
-void OFR_DecoderEngine::close() {}
+
+bool OFR_BitStream::seekable() const {
+    return open_ && rInt_->seekable(inst_) != C_FALSE;
+}
+
+int64_t OFR_BitStream::length() const {
+    return (open_ && rInt_->length) ? rInt_->length(inst_) : 0;
+}
+
+void OFR_BitStream::close() {
+    if (open_) {
+        open_ = false;
+        rInt_->close(inst_);
+    }
+}
+
+void OFR_RangeCoder::init(const uint8_t* data, size_t size, OFR_BitStream* spill_from, uint64_t limit) {
+    cur = data;
+    end = data + size;
+    spill = spill_from;
+    overrun = 0;
+    overrun_limit = limit;
+    next_byte();   // the encoder's dummy first byte
+    cache = next_byte();
+    range = 0x80;
+    value = cache >> 1;
+    normalize();
+}
+
+uint8_t OFR_RangeCoder::next_byte_past_end() {
+    uint8_t b;
+    if (spill && spill->read(&b, 1) == 1) return b;
+    if (++overrun > overrun_limit) throw OFR_StreamError("range coder ran past the end of the stream");
+    return 0;
+}
+
+// FUN_00016f10 / FUN_000173b0 (post=1 coded-range reduction). the reference picks between two
+// precisions depending on whether every channel's min/max fit a safe +-2^23 range:
+//   - narrow: 32-bit arithmetic, mult as its native SIGNED int32 value.
+//   - wide:   64-bit arithmetic, mult zero-extended to an UNSIGNED value.
+// the min result rounds down and the max result rounds up. mult and offset come from the stream,
+// so the narrow division goes through 64 bits, where INT32_MIN / -1 can't trap.
+static void ofr_reduce_range(bool wide, int min_val, int max_val, int offset, int mult, int& out_min, int& out_max) {
+    if (mult == 0) throw OFR_StreamError("post-processor multiplier is zero");
+    int64_t divisor, a_min, a_max;
+    if (wide) {
+        divisor = (int64_t)(uint32_t)mult;
+        a_min = (int64_t)min_val - (int64_t)offset;
+        a_max = (int64_t)max_val - (int64_t)offset;
+    } else {
+        divisor = mult;
+        a_min = (int32_t)((uint32_t)min_val - (uint32_t)offset);
+        a_max = (int32_t)((uint32_t)max_val - (uint32_t)offset);
+    }
+    int64_t q_min = a_min / divisor, r_min = a_min % divisor;
+    out_min = (int32_t)(q_min + (r_min < 0 ? -1 : 0));
+    int64_t q_max = a_max / divisor, r_max = a_max % divisor;
+    out_max = (int32_t)(r_max > 0 ? q_max + 1 : q_max);
+}
+
+void OFR_PostProcessor::read_channel(OFR_RangeCoder* rc, uint32_t bit_depth, int& mn, int& mx, int& mult, int& offset) {
+    auto sign_extend = [bit_depth](uint32_t val) {
+        uint32_t shift = 32 - bit_depth;
+        return (int32_t)(val << shift) >> shift;
+    };
+    mn = sign_extend(rc->read_uniform_split(bit_depth));
+    mx = sign_extend(rc->read_uniform_split(bit_depth));
+    if (rc->read_uniform_bits(1) == 0) {
+        mult = 1;
+        offset = 0;
+    } else {
+        mult = (int)rc->read_uniform_split(bit_depth);
+        offset = sign_extend(rc->read_uniform_split(bit_depth));
+    }
+}
+
+void OFR_PostProcessor::init(OFR_RangeCoder* rc, uint32_t bit_depth, uint32_t channels, bool clamp) {
+    m_channels = channels;
+    has_remap = false;
+    full_range_clamp = clamp;
+
+    read_channel(rc, bit_depth, min_val_L, max_val_L, mult_L, offset_L);
+    if (channels == 2) read_channel(rc, bit_depth, min_val_R, max_val_R, mult_R, offset_R);
+
+    auto is_wide = [this, channels] {
+        int lo = channels == 2 ? std::min(min_val_L, min_val_R) : min_val_L;
+        int hi = channels == 2 ? std::max(max_val_L, max_val_R) : max_val_L;
+        return lo < -0x800000 || hi >= 0x800000;
+    };
+
+    wide = is_wide();
+    ofr_reduce_range(wide, min_val_L, max_val_L, offset_L, mult_L, scaled_min_L, scaled_max_L);
+    if (channels == 2) ofr_reduce_range(wide, min_val_R, max_val_R, offset_R, mult_R, scaled_min_R, scaled_max_R);
+
+    if (clamp) {
+        uint32_t half = 1u << (bit_depth - 1);
+        min_val_L = min_val_R = (int32_t)(0u - half);
+        max_val_L = max_val_R = (int32_t)(half - 1u);
+        wide = is_wide();
+    }
+}
+
+void OFR_BlockDecoder::init_block(OFR_RangeCoder& rc, uint32_t reserved, uint32_t channels, uint32_t bits,
+                                  uint32_t values) {
+    post_type_ = pred_type_ = entropy_type_ = 0;
+    channels_ = channels;
+
+    const uint32_t post_type = reserved & 0x3f;
+    const uint32_t pred_type = (reserved >> 6) & 0x1f;
+    const uint32_t entropy_type = reserved >> 11;
+    const bool stereo = channels == 2;
+
+    if (post_type != 1 && post_type != 2) throw OFR_StreamError("invalid post-processor type");
+    if (!post_) post_ = std::make_unique<OFR_PostProcessor>();
+    if (post_type == 2) {
+        post_->init2(&rc, channels, bits);
+    } else {
+        post_->init(&rc, bits, channels, pred_type == 4);
+    }
+
+    // the predictor and the entropy coder work on the coded range of the post-processor
+    OFR_PostProcessor& pp = *post_;
+    const int mnL = pp.scaled_min_L, mxL = pp.scaled_max_L, mnR = pp.scaled_min_R, mxR = pp.scaled_max_R;
+    const int data_bits = stereo ? ofr_bitlen(std::min(mnL, mnR), std::max(mxL, mxR)) : ofr_bitlen(mnL, mxL);
+
+    switch (pred_type) {
+    case 1:
+        if (stereo) {
+            if (!predictor_stereo_) predictor_stereo_ = std::make_unique<OFR_PredictorStereo>();
+            predictor_stereo_->init(&rc);
+            predictor_stereo_->m_left_min = mnL;
+            predictor_stereo_->m_left_max = mxL;
+            predictor_stereo_->m_right_min = mnR;
+            predictor_stereo_->m_right_max = mxR;
+            predictor_stereo_->m_shift = 32u - (uint32_t)data_bits;
+        } else {
+            if (!predictor_) predictor_ = std::make_unique<OFR_Predictor>();
+            predictor_->init(&rc);
+            predictor_->min_val = mnL;
+            predictor_->max_val = mxL;
+            predictor_->shift = 32 - data_bits;
+        }
+        break;
+    case 2:
+    case 3:
+        if (stereo) {
+            if (!cascade_stereo_) cascade_stereo_ = std::make_unique<OFR_PredictorCascadeStereo>();
+            if (pred_type == 2) cascade_stereo_->init_cascade_only(&rc, mnL, mxL, mnR, mxR, data_bits);
+            else cascade_stereo_->init(&rc, mnL, mxL, mnR, mxR, data_bits, (int)values);
+        } else {
+            if (!cascade_mono_) cascade_mono_ = std::make_unique<OFR_PredictorCascadeMono>();
+            if (pred_type == 2) cascade_mono_->init_cascade_only(&rc, mnL, mxL, data_bits);
+            else cascade_mono_->init(&rc, mnL, mxL, data_bits, (int)values);
+        }
+        break;
+    case 4:
+        if (stereo) {
+            if (!dualstream_stereo_) dualstream_stereo_ = std::make_unique<OFR_PredictorDualStreamStereo>();
+            dualstream_stereo_->init(&rc, data_bits, values);
+        } else {
+            if (!dualstream_mono_) dualstream_mono_ = std::make_unique<OFR_PredictorDualStreamMono>();
+            dualstream_mono_->init(&rc, data_bits, values);
+        }
+        break;
+    default:
+        throw OFR_StreamError("invalid predictor type");
+    }
+
+    if (entropy_type == 3) {
+        if (!entropy_acm_) entropy_acm_ = std::make_unique<OFR_EntropyAcm>();
+        entropy_acm_->init(&rc, (uint32_t)data_bits, channels);
+    } else if (entropy_type == 1 || entropy_type == 2) {
+        if (!entropy_) entropy_ = std::make_unique<OFR_EntropyDecoder>();
+        entropy_->init((uint32_t)data_bits, channels, entropy_type);
+        entropy_->init_from_bitstream(&rc);
+    } else {
+        throw OFR_StreamError("invalid entropy coder type");
+    }
+
+    post_type_ = post_type;
+    pred_type_ = pred_type;
+    entropy_type_ = entropy_type;
+}
+
+void OFR_BlockDecoder::decode_block(int32_t* dest, uint32_t count, OFR_RangeCoder& rc) {
+    if (entropy_type_ == 3) entropy_acm_->decode_block(dest, count, &rc);
+    else entropy_->decode_block(dest, count, &rc);
+
+    const bool stereo = channels_ == 2;
+    switch (pred_type_) {
+    case 1:
+        if (stereo) predictor_stereo_->decode(dest, count);
+        else predictor_->decode(dest, count);
+        break;
+    case 2:
+    case 3:
+        if (stereo) cascade_stereo_->decode(dest, count);
+        else cascade_mono_->decode(dest, count);
+        break;
+    default:
+        if (stereo) dualstream_stereo_->decode(dest, count);
+        else dualstream_mono_->decode(dest, count);
+        break;
+    }
+
+    post_->decode(dest, count);
+}
+
+OFR_DecoderEngine::OFR_DecoderEngine(ReadInterface* rInt, void* readerInstance) : bs_(rInt, readerInstance) {}
+
+OFR_DecoderEngine::~OFR_DecoderEngine() {
+    close();
+}
+
+void OFR_DecoderEngine::close() {
+    bs_.close();
+}
+
+// the main block starts with "OFR " (or "OFRX" for IEEE Float) followed by a sane block size. a
+// self-extracting file has its decoder stub in front of that, so look a little further.
+void OFR_DecoderEngine::open() {
+    try {
+        uint8_t w[8];
+        bs_.read_exact(w, 8);
+        if (std::memcmp(w, "*RIF", 4) == 0) throw OFR_StreamError("OFR 4.5alpha file");
+
+        uint32_t scanned = 0;
+        uint32_t magic = le32(w), size = le32(w + 4);
+        while (!((magic == OFR_TAG_OFR || magic == OFR_TAG_OFRX) && size >= 0xc && size < 0x100)) {
+            if (++scanned >= MAGIC_SCAN_LIMIT) throw OFR_StreamError("not an OFR file");
+            std::memmove(w, w + 1, 7);
+            w[7] = bs_.read_u8();
+            magic = le32(w);
+            size = le32(w + 4);
+        }
+        is_float = magic == OFR_TAG_OFRX;
+
+        if (size == 0xc) throw OFR_StreamError("OFR 4.5alpha file");
+        if (size < 0xf || size >= 0x50) throw OFR_StreamError("invalid OFR file");
+
+        uint32_t ts_low = bs_.read_u32();
+        uint16_t ts_high = bs_.read_u16();
+        total_samples = ((uint64_t)ts_high << 32) | ts_low;
+        sample_type = bs_.read_u8();
+        channel_config = bs_.read_u8();
+        samplerate = bs_.read_u32();
+
+        uint16_t encoder_id = bs_.read_u16();
+        uint8_t compression = bs_.read_u8();
+        version = (encoder_id >> 4) + 0x1194;
+        speedup = compression & 7;
+        method = compression >> 3;
+
+        uint32_t consumed = 0xf;
+        if (size >= 0x11) {
+            uint32_t min_decoder_version = bs_.read_u16() + 0x1194u;
+            consumed = 0x11;
+            if (min_decoder_version > MAX_DECODER_VERSION) throw OFR_StreamError("unsupported newer version OFR file");
+        }
+
+        if (channel_config >= 2) throw OFR_StreamError("channels > 2");
+        if (sample_type >= OFR_SAMPLE_TYPE_COUNT) throw OFR_StreamError("invalid or unsupported newer version OFR file");
+        channels = channel_config + 1;
+        bitspersample = ofr_sample_bits(sample_type);
+
+        if (!bs_.skip(size - consumed)) throw OFR_StreamError("unexpected end of stream");
+
+        if (bs_.read_u32() != OFR_TAG_HEAD) throw OFR_StreamError("invalid OFR file");
+        uint32_t head_size = bs_.read_u32();
+        if (bs_.read_append(head, head_size) != head_size) throw OFR_StreamError("unexpected end of stream");
+
+        first_block_pos_ = next_block_pos_ = bs_.tell();
+    } catch (...) {
+        bs_.close();
+        throw;
+    }
+}
+
+void OFR_DecoderEngine::remember_block(uint64_t offset, uint64_t value_pos, uint32_t values) {
+    if (index_.empty() ? value_pos == 0 : index_.back().value_pos + index_.back().values == value_pos) {
+        index_.push_back({offset, value_pos, values});
+    }
+}
+
+// reads the next COMP block into memory and sets up its decoders. a bad block leaves
+// block_error_ set, so the caller emits silence for its length and carries on with the next one
+// (FUN at 0x12260 in the library); only losing the block structure itself is fatal.
+void OFR_DecoderEngine::next_block() {
+    block_error_ = false;
+
+    uint64_t block_pos = bs_.tell();
+    uint32_t magic = bs_.peek_tag();
+    if (magic != OFR_TAG_COMP) {
+        has_recoverable_errors = true;
+        if (!bs_.seek(next_block_pos_)) throw OFR_StreamError("lost the block structure");
+        block_pos = next_block_pos_;
+        if (bs_.read_u32() != OFR_TAG_COMP) throw OFR_StreamError("lost the block structure");
+    }
+
+    uint32_t comp_size = bs_.read_u32();
+    uint32_t stored_crc = bs_.read_u32();
+    if (comp_size < 13) throw OFR_StreamError("invalid COMP block size");
+    next_block_pos_ = block_pos + 8 + comp_size;
+
+    const uint64_t body_size = comp_size - 4;
+    payload_.clear();
+    uint64_t got = bs_.read_append(payload_, body_size);
+    if (got < 9) throw OFR_StreamError("unexpected end of stream");
+    if (got < body_size) has_recoverable_errors = true;
+
+    // the reference doesn't look at the CRC while decoding and neither does this decide anything:
+    // it only makes damage visible in the flag, the block is still decoded the same way
+    if (got == body_size && ofr_crc32(payload_.data(), payload_.size()) != stored_crc) has_recoverable_errors = true;
+
+    const uint8_t* p = payload_.data();
+    block_values_ = le32(p);
+    block_pos_ = 0;
+    remember_block(block_pos, position, block_values_);
+
+    const uint32_t block_sample_type = p[4], block_channel_config = p[5];
+    const uint32_t reserved = (uint32_t)p[6] | ((uint32_t)p[7] << 8);
+
+    std::vector<uint8_t> deta;
+    bool deta_ok = true;
+    if (is_float) {
+        if (bs_.read_u32() == OFR_TAG_DETA) {
+            uint32_t deta_size = bs_.read_u32();
+            bs_.read_u32();   // crc32
+            uint64_t deta_body = deta_size >= 4 ? deta_size - 4 : 0;
+            next_block_pos_ = bs_.tell() + deta_body;
+            deta_ok = bs_.read_append(deta, deta_body) == deta_body;
+        } else {
+            deta_ok = false;
+        }
+    }
+
+    try {
+        if (block_sample_type != sample_type || block_channel_config != channel_config)
+            throw OFR_StreamError("block format differs from the file");
+        if (block_values_ > total_samples - position || block_values_ > (uint32_t)INT32_MAX || block_values_ % channels != 0)
+            throw OFR_StreamError("invalid block length");
+        if (!deta_ok) throw OFR_StreamError("damaged DETA sub-block");
+
+        // integer blocks only: a float block's DETA sub-block sits in between, and the float
+        // decoder, a separate binary, wasn't checked for this
+        // a value takes well under 8 bytes even at 32 bits
+        range_coder_.init(p + 9, payload_.size() - 9, is_float ? nullptr : &bs_,
+                          OFR_RangeCoder::MAX_OVERRUN + 8ull * block_values_);
+        block_decoder_.init_block(range_coder_, reserved, channels, bitspersample, block_values_);
+        if (is_float) float_block_.init(std::move(deta));
+    } catch (const OFR_StreamError&) {
+        block_error_ = true;
+    } catch (const std::bad_alloc&) {
+        block_error_ = true;
+    } catch (const std::length_error&) {
+        block_error_ = true;
+    }
+    if (block_error_) {
+        has_recoverable_errors = true;
+        block_values_ = (uint32_t)std::min<uint64_t>(block_values_, total_samples - position);
+        block_values_ -= block_values_ % channels;
+    }
+    need_new_block_ = block_values_ == 0;
+}
+
+uint32_t OFR_DecoderEngine::read(int32_t* dest, uint32_t values, bool keep_partial) {
+    OFR_ScopedFpEnv fp_env;
+    values -= values % channels;
+    uint32_t done = 0;
+    try {
+        while (done < values && position < total_samples) {
+            if (need_new_block_) {
+                next_block();
+                if (need_new_block_) continue;
+            }
+
+            uint32_t n = std::min(block_values_ - block_pos_, values - done);
+            if (!block_error_) {
+                try {
+                    block_decoder_.decode_block(dest + done, n, range_coder_);
+                    if (is_float) float_block_.reconstruct(dest + done, n);
+                } catch (const OFR_StreamError&) {
+                    block_error_ = true;
+                    has_recoverable_errors = true;
+                }
+            }
+            if (block_error_) std::memset(dest + done, 0, (size_t)n * sizeof(int32_t));
+
+            done += n;
+            block_pos_ += n;
+            position += n;
+            if (block_pos_ == block_values_) need_new_block_ = true;
+        }
+    } catch (const OFR_StreamError&) {
+        if (done == 0 || !keep_partial) throw;
+    }
+    return done;
+}
+
+// walks the block headers from the closest indexed block, without decoding anything
+bool OFR_DecoderEngine::hop_to_block(uint64_t target) {
+    uint64_t offset = first_block_pos_, value_pos = 0;
+    auto it = std::upper_bound(index_.begin(), index_.end(), target,
+                               [](uint64_t t, const IndexEntry& e) { return t < e.value_pos; });
+    if (it != index_.begin()) {
+        --it;
+        offset = it->offset;
+        value_pos = it->value_pos;
+    }
+
+    while (true) {
+        if (!bs_.seek(offset) || bs_.read_u32() != OFR_TAG_COMP) return false;
+        uint32_t comp_size = bs_.read_u32();
+        if (comp_size < 13) return false;
+        bs_.read_u32();   // crc32
+        uint32_t values = bs_.read_u32();
+        remember_block(offset, value_pos, values);
+        if (target < value_pos + values) break;
+
+        uint64_t next = offset + 8 + comp_size;
+        if (is_float) {
+            if (!bs_.seek(next) || bs_.read_u32() != OFR_TAG_DETA) return false;
+            next += 8 + (uint64_t)bs_.read_u32();
+        }
+        offset = next;
+        value_pos += values;
+    }
+
+    if (!bs_.seek(offset)) return false;
+    next_block_pos_ = offset;
+    position = value_pos;
+    need_new_block_ = true;
+    return true;
+}
+
+// blocks are independent, so a seek is a hop to the right block plus decoding up to the target
+bool OFR_DecoderEngine::seek(uint64_t target) {
+    if (target == position) return true;
+    if (target >= total_samples || !bs_.seekable()) return false;
+
+    const bool in_current_block = !need_new_block_ && target > position &&
+                                  target < position - block_pos_ + block_values_;
+    if (!in_current_block) {
+        try {
+            if (!hop_to_block(target)) return false;
+        } catch (const OFR_StreamError&) {
+            return false;
+        }
+    }
+
+    scratch_.resize(1u << 16);
+    while (position < target) {
+        uint32_t n = (uint32_t)std::min<uint64_t>(target - position, scratch_.size());
+        if (read(scratch_.data(), n) == 0) return false;
+    }
+    return true;
+}
+
+void OFR_DecoderEngine::read_tail() {
+    uint32_t magic = bs_.peek_tag();
+    if (magic != OFR_TAG_TAIL) {
+        has_recoverable_errors = true;
+        if (!bs_.seek(next_block_pos_) || bs_.read_u32() != OFR_TAG_TAIL) throw OFR_StreamError("no TAIL block");
+    }
+    uint32_t tail_size = bs_.read_u32();
+    tail.clear();
+    if (bs_.read_append(tail, tail_size) != tail_size) throw OFR_StreamError("unexpected end of stream");
+}
+
+const char* ofr_method_name(uint32_t method) {
+    static const char* const names[] = {"fast", "normal", "high", "extra", "best", "ultra", "insane", "highnew",
+                                        "extranew", "bestnew", "ultranew", "extrafast", "turbonew", "fastnew",
+                                        "normalnew"};
+    return method < sizeof(names) / sizeof(names[0]) ? names[method] : "unknown";
+}
+
+const char* ofr_speedup_name(uint32_t speedup) {
+    static const char* const names[] = {"1x", "2x", "4x"};
+    return speedup < sizeof(names) / sizeof(names[0]) ? names[speedup] : "unknown";
+}
+
+const char* ofr_sample_type_name(uint32_t sample_type) {
+    static const char* const names[] = {"UINT8", "SINT8", "UINT16", "SINT16", "UINT24", "SINT24", "UINT32", "SINT32",
+                                        "FLOAT32_1", "FLOAT32_16", "FLOAT32_24"};
+    return sample_type < sizeof(names) / sizeof(names[0]) ? names[sample_type] : "unknown";
+}
+
+const char* ofr_channel_config_name(uint32_t channel_config) {
+    static const char* const names[] = {"MONO", "STEREO_LR"};
+    return channel_config < sizeof(names) / sizeof(names[0]) ? names[channel_config] : "unknown";
+}

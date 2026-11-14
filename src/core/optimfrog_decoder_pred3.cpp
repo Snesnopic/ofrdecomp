@@ -1,28 +1,24 @@
-// pred_type=3 — dual predictor: standard LPC + cascade NLMS (presets 4-10).
-// Compiled WITHOUT -ffast-math (see CMakeLists) for float32 bit-exactness.
-// Full RE map in doc/pred3_analysis.md.
-//
-// STATUS: mono AND stereo bit-exact vs reference (all presets 4-10). Final combiner is an
-// LDLT-solved LPC whose initial last_halve comes from the golomb param field (0x437ac/0x67284).
-// Stereo uses two cross-channel cascades sharing two per-stage error rings.
+// pred_type=3: dual predictor, standard LPC plus cascade NLMS (presets 4-10).
+// pred_type=2: the cascade alone, no LPC and no schedule.
+// float32 bit-exactness depends on the exact operation order below, see doc/pred3_analysis.md.
+// final combiner: LDLT-solved LPC whose initial last_halve comes from the golomb param field
+// (0x437ac/0x67284). stereo uses two cross-channel cascades sharing two per-stage error rings.
 
 #include "../../include/optimfrog_decoder.h"
-#include "optimfrog_tables.h"
+#include "../../include/optimfrog_tables.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <algorithm>
 
-// Emulates the x86 cvtsd2si/cvttsd2si "integer indefinite" behavior: on int32 overflow,
-// hardware yields INT32_MIN (0x80000000), not a modular wraparound (see the identical
-// helper + rationale in optimfrog_decoder_predictor.cpp). Only matters for 32-bit-range
-// content whose prediction can overshoot INT32_MAX.
-// Left-shifting a negative int is UB pre-C++20; see the identical helper + rationale in
-// optimfrog_decoder_predictor.cpp. Routes the shift-wrap trick through an unsigned shift.
-static inline int32_t shl_wrap(int32_t x, int sh) { return (int32_t)((uint32_t)x << sh); }
+// the rings wrap at RING_WRAP; the slack past it covers the unrolled reads of a 4-tap stage
+static constexpr int RING_WRAP = 0x400;
+static constexpr int RING_SIZE = RING_WRAP + 8;
 
-static inline int32_t round_to_int32_cvtsd2si(double x) {
-    long lr = std::lrint(x);
-    return (lr < INT32_MIN || lr > INT32_MAX) ? INT32_MIN : (int32_t)lr;
+// FUN_0000ea10: sizes must fill whole 8-tap iterations, or be exactly the 4-tap special case
+static void check_stage_sizes(int size1, int size2) {
+    bool aligned = ((size1 | size2) & 7) == 0 || (size1 == 4 && size2 == 4) || (size1 == 4 && size2 == 0);
+    if (!aligned || size1 < 1 || std::max(size1 + 1, size2) >= RING_WRAP)
+        throw OFR_StreamError("invalid cascade stage size");
 }
 
 // --- adaptive 2-symbol Markov context for the segment schedule (FUN_0000fb90 family) ---
@@ -91,20 +87,8 @@ static const double DAT_19718 = 1.0 / 1024.0;
 static const int cascade_order_tbl[] = {512,256,128,64,128,64,32,16,0,0,0,0,0,0,0,0,
                                         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
-void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/, int mn, int mx, int dbits, int total) {
-    min_val = mn; max_val = mx; shift = 32 - dbits; total_samples = total;
-
-    // --- main LPC params (same as pred=1) ---
-    uint32_t w = rc->read_uniform_bits(12);
-    main_weight_param = (w == 0xfff) ? (rc->read_uniform_bits(16) + 0x1001) : (w + 2);
-
-    uint32_t iv = rc->read_uniform_bits(3);
-    main_interval = (iv == 7) ? (rc->read_uniform_bits(16) + 1) : (uint32_t)DAT_00326238[iv];
-
-    uint32_t od = rc->read_uniform_bits(5);
-    main_order = (od == 0x1f) ? (rc->read_uniform_bits(8) + 1) : (uint32_t)DAT_00326220[od];
-
-    // --- cascade params ---
+// everything after the LPC parameters, common to pred_type=2 and 3 (FUN_0000a3b0)
+void OFR_PredictorCascadeMono::read_cascade_params(OFR_RangeCoder* rc) {
     n_stages = (int)rc->read_uniform_bits(3) + 1;             // 0x437a0
 
     // 0x43798 decay scale: 1 bit; if set, read 10-bit/1024 else 1.0
@@ -144,6 +128,7 @@ void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/, 
         int order = (o5 == 0x1f) ? ((int)rc->read_uniform_bits(8) * 4 + 4) : cascade_order_tbl[o5];
         uint32_t mu10 = rc->read_uniform_bits(10);
         double mu = (double)mu10 / DAT_19688;
+        check_stage_sizes(order, 0);
 
         OFR_CascadeStage& st = stages[s];
         st.order = order;
@@ -152,12 +137,10 @@ void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/, 
         int wpad = std::max(8, order);
         st.weights.assign(wpad, 0.0f);
         st.energy = 0.0;
-        st.ring.assign(0x400, 0.0f);
+        st.ring.assign(RING_SIZE, 0.0f);
         st.ring_copy = order + 1;
         st.ring_cur = order + 1;
     }
-
-    seg_len = (int)main_interval;   // 0x436ac
 
     // final combiner
     fc_size = n_stages;
@@ -167,31 +150,58 @@ void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/, 
     fc_counter = 0; fc_last_halve = golomb_field;
     fc_mat.assign(std::max(1, fc_size), std::vector<double>(std::max(1, fc_size), 0.0));
     fc_v.assign(std::max(1, fc_size) + 1, 0.0);
+}
+
+void OFR_PredictorCascadeMono::init(OFR_RangeCoder* rc, int mn, int mx, int dbits, int total) {
+    min_val = mn; max_val = mx; shift = 32 - dbits; total_samples = total;
+    cascade_only = false;
+
+    // --- main LPC params (same as pred=1) ---
+    uint32_t w = rc->read_uniform_bits(12);
+    main_weight_param = (w == 0xfff) ? (rc->read_uniform_bits(16) + 0x1001) : (w + 2);
+
+    uint32_t iv = rc->read_uniform_bits(3);
+    main_interval = (iv == 7) ? (rc->read_uniform_bits(16) + 1) : (uint32_t)DAT_00326238[iv];
+
+    uint32_t od = rc->read_uniform_bits(5);
+    main_order = (od == 0x1f) ? (rc->read_uniform_bits(8) + 1) : (uint32_t)DAT_00326220[od];
+    if (main_order < 1 || main_order > (uint32_t)OFR_MAX_ORDER) throw OFR_StreamError("invalid predictor order");
+
+    read_cascade_params(rc);
+
+    seg_len = (int)main_interval;   // 0x436ac
 
     // --- decode the entropy-coded per-segment schedule (0x437b8) ---
     int order_p1 = (int)main_order + 1;
     int firstcd = std::min(order_p1, total);
     int nseg = (total + (~firstcd) + seg_len) / seg_len;   // matches binary integer math
     if (nseg < 0) nseg = 0;
-    schedule.assign((size_t)nseg + 2, 0);
+    schedule.clear();
+    schedule.reserve((size_t)std::min(nseg + 2, 1 << 16));
 
     SchedCtx sctx[2];
     sched_init(sctx[0], 2, 0x8000);
     sched_init(sctx[1], 2, 0x8000);
     uint32_t prev = sched_decode(sctx[0], rc);
-    schedule[0] = (uint8_t)prev;
+    schedule.push_back((uint8_t)prev);
     for (int i = 1; i <= nseg; ++i) {   // binary decodes N+1 symbols total
         uint32_t sym = sched_decode(sctx[prev], rc);
-        schedule[i] = (uint8_t)sym;
+        schedule.push_back((uint8_t)sym);
         prev = sym;
     }
-    schedule[nseg + 1] = 1;  // sentinel
+    schedule.push_back(1);  // sentinel
 
     cc_count = firstcd;          // 0x436b4
     cc_mode = schedule[0];       // 0x436b0
     sched_idx = 1;               // 0x436b8
     need_init = true;
+}
 
+void OFR_PredictorCascadeMono::init_cascade_only(OFR_RangeCoder* rc, int mn, int mx, int dbits) {
+    min_val = mn; max_val = mx; shift = 32 - dbits;
+    cascade_only = true;
+    read_cascade_params(rc);
+    need_init = true;
 }
 
 // encoder-side: same state setup as init() but from explicit params (no range coder reads).
@@ -218,11 +228,12 @@ void OFR_PredictorCascadeMono::setup_for_encode(int mn, int mx, int dbits, int t
         int wpad = std::max(8, order);
         st.weights.assign(wpad, 0.0f);
         st.energy = 0.0;
-        st.ring.assign(0x400, 0.0f);
+        st.ring.assign(RING_SIZE, 0.0f);
         st.ring_copy = order + 1;
         st.ring_cur = order + 1;
     }
 
+    cascade_only = false;
     seg_len = (int)main_interval;
     fc_size = n_stages;
     fc_decay = ((double)fc_weight_param - 1.0) / (double)fc_weight_param;
@@ -246,10 +257,9 @@ void OFR_PredictorCascadeMono::cascade_init() {
     stage_pred.assign(n_stages + 2, 0.0);
     errv.assign(n_stages + 2, 0.0);
     cumsum.assign(n_stages + 2, 0.0);
-    // main LPC
+    if (cascade_only) return;
     main_lpc.init((int)main_order, (int)main_interval,
                   ((double)main_weight_param - 1.0) / (double)main_weight_param);
-    // stages already allocated in init()
 }
 
 // FUN_0000f850: stage FIR (float32, x8 unroll, 4 accumulators)
@@ -355,9 +365,9 @@ int OFR_PredictorCascadeMono::cascade_predict() {
     for (int s = 1; s <= n_stages; ++s) {
         OFR_CascadeStage& st = stages[s];
         st.ring_cur++;
-        if (st.ring_cur == 0x400) {
+        if (st.ring_cur == RING_WRAP) {
             for (int kk = 0; kk < st.ring_copy; ++kk)
-                st.ring[kk] = st.ring[0x400 - st.ring_copy + kk];
+                st.ring[kk] = st.ring[RING_WRAP - st.ring_copy + kk];
             st.ring_cur = st.ring_copy;
         }
         st.ring[st.ring_cur] = 0.0f;
@@ -403,26 +413,36 @@ void OFR_PredictorCascadeMono::cascade_update(double actual) {
 void OFR_PredictorCascadeMono::decode(int32_t* dest, uint32_t count) {
     if (need_init) {
         cascade_init();
-        sample_counter = 0xac44;
         need_init = false;
     }
     int sh = shift & 0x1f;
+    auto reconstruct = [&](int p, int res) {
+        int cp = std::max(min_val, std::min(p, max_val));
+        int out = ofr_wrap_add(cp, res, sh);
+        if (out < min_val || out > max_val) throw OFR_StreamError("reconstructed sample out of range");
+        return out;
+    };
+
+    if (cascade_only) {
+        for (uint32_t i = 0; i < count; ++i) {
+            int out = reconstruct(cascade_predict(), dest[i]);
+            dest[i] = out;
+            cascade_update((double)out);
+        }
+        return;
+    }
+
     for (uint32_t i = 0; i < count; ++i) {
-        if (--sample_counter == 0) sample_counter = 0xac44;
         int res = dest[i];
         int out;
         if (cc_mode == 0) {
-            int p = round_to_int32_cvtsd2si(main_lpc.predict());
-            int cp = std::max(min_val, std::min(p, max_val));
-            out = shl_wrap(cp + res, sh) >> sh;
+            out = reconstruct(round_to_int32_cvtsd2si(main_lpc.predict()), res);
             dest[i] = out;
             main_lpc.update((double)out);
             cascade_predict();
             cascade_update((double)out);
         } else {
-            int p = cascade_predict();
-            int cp = std::max(min_val, std::min(p, max_val));
-            out = shl_wrap(cp + res, sh) >> sh;
+            out = reconstruct(cascade_predict(), res);
             dest[i] = out;
             cascade_update((double)out);
             main_lpc.update((double)out);
@@ -510,8 +530,8 @@ int OFR_PredictorCascadeStereo::sub_predict(OFR_SubCascade& c,
     for (int s = 1; s <= c.n_stages; ++s) {
         OFR_CascadeRing& pr = pri[s];
         pr.cur++;
-        if (pr.cur == 0x400) {
-            for (int kk = 0; kk < pr.copy; ++kk) pr.ring[kk] = pr.ring[0x400 - pr.copy + kk];
+        if (pr.cur == RING_WRAP) {
+            for (int kk = 0; kk < pr.copy; ++kk) pr.ring[kk] = pr.ring[RING_WRAP - pr.copy + kk];
             pr.cur = pr.copy;
         }
         pr.ring[pr.cur] = 0.0f;
@@ -570,22 +590,14 @@ static void sub_cascade_alloc(OFR_SubCascade& c, int nstages, double dec, uint32
 }
 
 void OFR_PredictorCascadeStereo::cascade_init() {
-    main.init(((double)main_weight_param - 1.0) / (double)main_weight_param,
-              (int)main_max_order, (int)main_max_order - (int)main_right_order, main_interval);
+    if (cascade_only) return;
+    const OFR_StereoLpcParams& m = main_params;
+    main.init(((double)m.weight_param - 1.0) / (double)m.weight_param, m.max_order, m.max_order - m.right_order,
+              m.update_interval);
 }
 
-void OFR_PredictorCascadeStereo::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/,
-        int Lmn,int Lmx,int Rmn,int Rmx, int dbits, int total) {
-    min_L=Lmn; max_L=Lmx; min_R=Rmn; max_R=Rmx; shift=32-dbits; total_samples=total;
-
-    uint32_t w = rc->read_uniform_bits(12);
-    main_weight_param = (w == 0xfff) ? (rc->read_uniform_bits(16) + 0x1001) : (w + 2);
-    uint32_t iv = rc->read_uniform_bits(3);
-    main_interval = (iv == 7) ? (rc->read_uniform_bits(16) + 1) : (uint32_t)DAT_00326238[iv];
-    uint32_t od = rc->read_uniform_bits(5);
-    if (od == 0x1f) { main_max_order = rc->read_uniform_bits(8) + 1; main_right_order = rc->read_uniform_bits(8); }
-    else { main_max_order = (uint32_t)DAT_00326220[od]; main_right_order = (uint32_t)DAT_00326200[od]; }
-
+// everything after the LPC parameters, common to pred_type=2 and 3 (FUN_0000b1b0 family)
+void OFR_PredictorCascadeStereo::read_cascade_params(OFR_RangeCoder* rc) {
     int n_stages = (int)rc->read_uniform_bits(3) + 1;
     double cc_decay;
     { rc->normalize(); uint32_t half = rc->range >> 1;
@@ -614,6 +626,7 @@ void OFR_PredictorCascadeStereo::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/
         if (o5 == 0x1f) { size1 = (int)rc->read_uniform_bits(8)*4+4; size2 = (int)rc->read_uniform_bits(8)*4; }
         else { size1 = cascade_order_tbl[o5]; size2 = cascade_size2_tbl[o5]; }
         double mu = (double)rc->read_uniform_bits(10) / DAT_19688;
+        check_stage_sizes(size1, size2);
         OFR_SubCascade* subs[2] = {&casL, &casR};
         for (int ci = 0; ci < 2; ++ci) {
             OFR_CascadeStageX& st = subs[ci]->stages[s];
@@ -624,35 +637,49 @@ void OFR_PredictorCascadeStereo::init(OFR_RangeCoder* rc, uint32_t /*bit_depth*/
         int rsz = std::max(size1 + 1, size2);
         OFR_CascadeRing* rgs[2] = {&ringsA[s], &ringsB[s]};
         for (int ri = 0; ri < 2; ++ri) {
-            rgs[ri]->ring.assign(0x400, 0.0f); rgs[ri]->copy = rsz; rgs[ri]->cur = rsz;
+            rgs[ri]->ring.assign(RING_SIZE, 0.0f); rgs[ri]->copy = rsz; rgs[ri]->cur = rsz;
         }
     }
+}
 
-    seg_len = (int)main_interval;
+void OFR_PredictorCascadeStereo::init(OFR_RangeCoder* rc, int Lmn,int Lmx,int Rmn,int Rmx, int dbits, int total) {
+    min_L=Lmn; max_L=Lmx; min_R=Rmn; max_R=Rmx; shift=32-dbits; total_samples=total;
+    cascade_only = false;
+
+    main_params.read(rc);
+    read_cascade_params(rc);
+
+    seg_len = (int)main_params.update_interval;
 
     int frames = total / 2;
-    int firstcd = std::min((int)main_max_order - (int)main_right_order + 1, frames);
+    int firstcd = std::min(main_params.max_order - main_params.right_order + 1, frames);
     int nseg = (frames + (~firstcd) + seg_len) / seg_len;
     if (nseg < 0) nseg = 0;
-    schedL.assign((size_t)nseg + 2, 0);
-    schedR.assign((size_t)nseg + 2, 0);
+    schedL.clear();
+    schedR.clear();
     SchedCtx cl[2], cr[2];
     sched_init(cl[0],2,0x8000); sched_init(cl[1],2,0x8000);
     sched_init(cr[0],2,0x8000); sched_init(cr[1],2,0x8000);
-    uint32_t pL = sched_decode(cl[0], rc); schedL[0] = (uint8_t)pL;
-    uint32_t pR = sched_decode(cr[0], rc); schedR[0] = (uint8_t)pR;
+    uint32_t pL = sched_decode(cl[0], rc); schedL.push_back((uint8_t)pL);
+    uint32_t pR = sched_decode(cr[0], rc); schedR.push_back((uint8_t)pR);
     for (int i = 1; i <= nseg; ++i) {
-        uint32_t sL = sched_decode(cl[pL], rc); schedL[i] = (uint8_t)sL; pL = sL;
-        uint32_t sR = sched_decode(cr[pR], rc); schedR[i] = (uint8_t)sR; pR = sR;
+        uint32_t sL = sched_decode(cl[pL], rc); schedL.push_back((uint8_t)sL); pL = sL;
+        uint32_t sR = sched_decode(cr[pR], rc); schedR.push_back((uint8_t)sR); pR = sR;
     }
-    schedL[nseg + 1] = 1; schedR[nseg + 1] = 1;
+    schedL.push_back(1); schedR.push_back(1);
 
     cc_count = firstcd;
     mode_L = schedL[0];
     mode_R = schedR[0];
     sched_idx = 1;
     need_init = true;
+}
 
+void OFR_PredictorCascadeStereo::init_cascade_only(OFR_RangeCoder* rc, int Lmn,int Lmx,int Rmn,int Rmx, int dbits) {
+    min_L=Lmn; max_L=Lmx; min_R=Rmn; max_R=Rmx; shift=32-dbits;
+    cascade_only = true;
+    read_cascade_params(rc);
+    need_init = true;
 }
 
 void OFR_PredictorCascadeStereo::setup_for_encode(int Lmn,int Lmx,int Rmn,int Rmx, int dbits, int total,
@@ -662,7 +689,11 @@ void OFR_PredictorCascadeStereo::setup_for_encode(int Lmn,int Lmx,int Rmn,int Rm
         const std::vector<int>& stage_mu10,
         const std::vector<uint8_t>& schL, const std::vector<uint8_t>& schR) {
     min_L=Lmn; max_L=Lmx; min_R=Rmn; max_R=Rmx; shift=32-dbits; total_samples=total;
-    main_weight_param=main_w; main_interval=main_iv; main_max_order=main_maxord; main_right_order=main_rightord;
+    cascade_only = false;
+    main_params.weight_param = main_w;
+    main_params.update_interval = main_iv;
+    main_params.max_order = (int32_t)main_maxord;
+    main_params.right_order = (int32_t)main_rightord;
 
     sub_cascade_alloc(casL, n_stages, decay_, fcw, 1u << fch_k, golomb_field);
     sub_cascade_alloc(casR, n_stages, decay_, fcw, 1u << fch_k, golomb_field);
@@ -685,13 +716,13 @@ void OFR_PredictorCascadeStereo::setup_for_encode(int Lmn,int Lmx,int Rmn,int Rm
         }
         int rsz = std::max(size1 + 1, size2);
         OFR_CascadeRing* rgs[2] = {&ringsA[s], &ringsB[s]};
-        for (int ri = 0; ri < 2; ++ri) { rgs[ri]->ring.assign(0x400, 0.0f); rgs[ri]->copy = rsz; rgs[ri]->cur = rsz; }
+        for (int ri = 0; ri < 2; ++ri) { rgs[ri]->ring.assign(RING_SIZE, 0.0f); rgs[ri]->copy = rsz; rgs[ri]->cur = rsz; }
     }
 
-    seg_len = (int)main_interval;
+    seg_len = (int)main_iv;
     schedL = schL; schedR = schR;
     int frames = total / 2;
-    int firstcd = std::min((int)main_max_order - (int)main_right_order + 1, frames);
+    int firstcd = std::min((int)main_maxord - (int)main_rightord + 1, frames);
     cc_count = firstcd;
     mode_L = schedL[0]; mode_R = schedR[0];
     sched_idx = 1;
@@ -699,24 +730,38 @@ void OFR_PredictorCascadeStereo::setup_for_encode(int Lmn,int Lmx,int Rmn,int Rm
 }
 
 void OFR_PredictorCascadeStereo::decode(int32_t* dest, uint32_t count) {
-    if (need_init) { cascade_init(); sample_counter = 0xac44; need_init = false; }
+    if (need_init) { cascade_init(); need_init = false; }
     int sh = shift & 0x1f;
+    auto reconstruct = [sh](int p, int res, int mn, int mx) {
+        int cp = std::max(mn, std::min(p, mx));
+        int out = ofr_wrap_add(cp, res, sh);
+        if (out < mn || out > mx) throw OFR_StreamError("reconstructed sample out of range");
+        return out;
+    };
+
+    if (cascade_only) {
+        for (uint32_t i = 0; i < count; i += 2) {
+            int outL = reconstruct(sub_predict(casL, ringsA, ringsB), dest[i], min_L, max_L);
+            dest[i] = outL;
+            sub_update(casL, ringsA, ringsB, (double)outL);
+            int outR = reconstruct(sub_predict(casR, ringsB, ringsA), dest[i+1], min_R, max_R);
+            dest[i+1] = outR;
+            sub_update(casR, ringsB, ringsA, (double)outR);
+        }
+        return;
+    }
+
     for (uint32_t i = 0; i < count; i += 2) {
-        if (--sample_counter == 0) sample_counter = 0xac44;
         int resL = dest[i];
         int outL;
         if (mode_L == 0) {
-            int p = round_to_int32_cvtsd2si(main.predictLeft());
-            int cp = std::max(min_L, std::min(p, max_L));
-            outL = shl_wrap(cp + resL, sh) >> sh;
+            outL = reconstruct(round_to_int32_cvtsd2si(main.predictLeft()), resL, min_L, max_L);
             dest[i] = outL;
             main.updateLeft((double)outL);
             sub_predict(casL, ringsA, ringsB);
             sub_update(casL, ringsA, ringsB, (double)outL);
         } else {
-            int p = sub_predict(casL, ringsA, ringsB);
-            int cp = std::max(min_L, std::min(p, max_L));
-            outL = shl_wrap(cp + resL, sh) >> sh;
+            outL = reconstruct(sub_predict(casL, ringsA, ringsB), resL, min_L, max_L);
             dest[i] = outL;
             sub_update(casL, ringsA, ringsB, (double)outL);
             main.updateLeft((double)outL);
@@ -724,17 +769,13 @@ void OFR_PredictorCascadeStereo::decode(int32_t* dest, uint32_t count) {
         int resR = dest[i+1];
         int outR;
         if (mode_R == 0) {
-            int p = round_to_int32_cvtsd2si(main.predictRight());
-            int cp = std::max(min_R, std::min(p, max_R));
-            outR = shl_wrap(cp + resR, sh) >> sh;
+            outR = reconstruct(round_to_int32_cvtsd2si(main.predictRight()), resR, min_R, max_R);
             dest[i+1] = outR;
             main.updateRight((double)outR);
             sub_predict(casR, ringsB, ringsA);
             sub_update(casR, ringsB, ringsA, (double)outR);
         } else {
-            int p = sub_predict(casR, ringsB, ringsA);
-            int cp = std::max(min_R, std::min(p, max_R));
-            outR = shl_wrap(cp + resR, sh) >> sh;
+            outR = reconstruct(sub_predict(casR, ringsB, ringsA), resR, min_R, max_R);
             dest[i+1] = outR;
             sub_update(casR, ringsB, ringsA, (double)outR);
             main.updateRight((double)outR);

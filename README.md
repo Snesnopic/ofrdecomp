@@ -1,81 +1,102 @@
 # ofrdecomp
 
-A from-scratch C++ decompilation and reimplementation of the [OptimFROG](http://losslessaudio.org/)
-lossless audio codec, reverse-engineered from the closed-source reference binary
-(`libOptimFROG.0.dylib`, v5.100, macOS x86_64).
+A C++ reimplementation of the [OptimFROG](http://losslessaudio.org/) audio codecs, reverse-engineered
+from the closed-source v5.100 binaries.
 
-The goal is a decoder + encoder that reproduces the reference implementation **bit-exactly**,
-verified directly against the original binaries rather than assumed from the format spec alone.
+The goal is a decoder that matches the official one bit for bit and an encoder whose files the
+official decoder reads back losslessly, on any platform and from a library. Both are checked against
+the official binaries rather than assumed from a format description.
 
 ## Status
 
-Both the decoder and the encoder are working and extensively verified:
+| Format | Decoder | Encoder |
+|---|---|---|
+| Lossless (`.ofr`), mono and stereo, 8/16/24/32-bit | yes | yes |
+| IEEE Float (`.off`) | yes | yes |
+| DualStream (`.ofs`, lossy) | yes | no |
 
-- **Decoder**: bit-exact across mono/stereo, 8/16/24/32-bit, all predictor types (`pred=1` LPC,
-  `pred=3` cascade NLMS), all entropy types (`ent=1` fast, `ent=2` slow, `ent=3` ACM), both
-  post-processors (`post=1` identity/scale, `post=2` value-remap), and multi-block real-world audio.
-- **Encoder**: produces valid, lossless `.ofr` files decodable by both our own decoder and the
-  reference decoder, across the same pred/ent/post/bit-depth matrix, with a small preset-search
-  mode (`OFR_BEST=1`) that picks the smallest output among a few safe configurations.
-
-See [doc/status.md](doc/status.md) for the detailed coverage matrix and known residual gaps, and
-[tests/conformance/](tests/conformance/) for the test suite that proves it — a bidirectional check
-against the reference binaries (reference-encoded files decode identically to ours; our
-encoder's files decode losslessly on the reference).
+[doc/status.md](doc/status.md) lists what each part was verified against, including what still
+waits for a run against the official binaries.
 
 ## Building
 
 ```sh
 cmake -B build
 cmake --build build
+ctest --test-dir build
 ```
 
-Produces three binaries in `build/`:
+Floating point has to stay exact for the output to match, so the build sets `-fno-fast-math
+-ffp-contract=off`, or `/fp:precise` on MSVC. 32-bit x86 also needs SSE2 math, which the build
+turns on.
 
-- `ofr` — unified CLI aiming for usage parity with the original tool:
+This produces:
+
+- `ofr`, a command line tool modelled on the original:
   ```sh
   ofr --encode [options] src [--output dst] ...
   ofr --decode [options] src [--output dst] ...
   ofr --info src ...
+  ofr --verify src ...
+  ofr --check src ...
   ```
-  Supports `--preset {0-10,max}`, `--raw` + `--channelconfig`/`--sampletype`/`--rate` (headerless
-  PCM), WAV in/out by default, `--output`, `--overwrite`, `--silent`, `--help`. Skips the original's
-  rarely-used flags (`--selfextract`, `--deleteafter`, `--timestamp`, `--incorrectheader`, ...).
-- `ofrdecomp` / `ofrenc` — the original minimal single-purpose CLIs (decode-only /
-  positional-args encode), kept for backward compatibility with existing scripts.
+  Options include `--preset {0-10,max}`, `--threads n`, `--raw` with
+  `--channelconfig`/`--sampletype`/`--rate`, `--output`, `--overwrite`, `--silent` and `--help`.
+  WAV files are restored byte for byte, including chunks around the audio.
+- `ofrdecomp` and `ofrenc`, minimal tools for scripts.
+- `ofrdecomp_lib`, the library behind them.
 
-## Repository layout
+## Using the library
 
+`include/ofrdecomp.hpp` is the C++ interface:
+
+```cpp
+#include "ofrdecomp.hpp"
+
+ofrdecomp::Decoder decoder("track.ofr");            // also from memory, or a custom Stream
+std::vector<int32_t> samples = decoder.readAll();
+
+ofrdecomp::EncodeOptions options;
+options.threads = 4;
+std::vector<uint8_t> file = ofrdecomp::Encoder::encode(samples, 2, 44100, 16, options);
 ```
-src/            decoder + encoder implementation
-include/        public + internal headers
-tests/          conformance test suite (bidirectional proof vs the reference binaries)
-doc/            reverse-engineering notes and format documentation
-```
+
+`include/OptimFROG.h` offers the C interface of the official library, for programs written against
+it.
 
 ## Testing
 
 ```sh
-bash tests/conformance/run.sh
+ctest --test-dir build                              # no external files needed
+bash tests/conformance/run.sh                       # lossless, against the official binaries
+bash tests/conformance/run_float.sh                 # IEEE Float, against the official binaries
 ```
 
-Runs the full bidirectional suite against a real-audio corpus plus a synthetic battery of
-edge cases (silence, full-scale, degenerate/tonal signals, boundary lengths). See
-[tests/conformance/run.sh](tests/conformance/run.sh) for environment knobs (corpus size, presets,
-bit depths tested).
+The conformance scripts check both directions: files from the official encoder decode identically
+here, and files from this encoder decode losslessly on the official decoder. They need the official
+tools, from the [OptimFROG site](http://losslessaudio.org/); see the top of each script for the
+paths and options.
+
+To fuzz the decoder, with a clang that ships libFuzzer:
+
+```sh
+cmake -B build-fuzz -DOFRDECOMP_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build-fuzz
+mkdir corpus && build-fuzz/make_corpus corpus
+build-fuzz/fuzz_decoder corpus -max_len=32768
+```
 
 ## Documentation
 
-- [doc/status.md](doc/status.md) — current bit-exactness coverage and known gaps
-- [doc/format.md](doc/format.md) — OFR container/bitstream format as reverse-engineered
-- [doc/optimfrog_re_knowledge.md](doc/optimfrog_re_knowledge.md) — algorithm overview (range coder,
-  entropy decoders, predictors, post-processors)
-- [doc/pred3_analysis.md](doc/pred3_analysis.md), [doc/ent3_analysis.md](doc/ent3_analysis.md),
-  [doc/post2_remap_analysis.md](doc/post2_remap_analysis.md) — deep dives on the cascade predictor,
-  ACM entropy coder, and value-remap post-processor respectively
+[doc/README.md](doc/README.md) indexes the format description and the notes on each algorithm.
 
-## License / provenance
+## License
 
-This is a clean-room-adjacent reverse-engineering project built by dynamic and static analysis of
-the reference binary for interoperability purposes. It is not affiliated with or endorsed by the
-original OptimFROG author.
+MIT, see [LICENSE](LICENSE). This covers the code and text in this repository. It grants nothing
+over the OptimFROG name or the official software, which stays under its own terms. The official
+binaries are not part of this repository: CI downloads them at run time, only to compare against.
+
+This project was built by analysing the official binaries, statically and at run time, for
+interoperability. It is not a clean-room implementation, and it is not affiliated with or endorsed
+by the author of OptimFROG.

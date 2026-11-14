@@ -1,8 +1,100 @@
-#include "OptimFROG.h"
+// C API on top of OFR_DecoderEngine. return values, position handling and the file helpers follow
+// the official library (exported functions at 0x1550-0x2a90 of libOptimFROG.0.dylib).
+#include "../../include/OptimFROG.h"
 #include "../../include/optimfrog_decoder.h"
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstdio>
+#include <memory>
+#include <new>
+#include <vector>
+
+#if defined(_WIN32)
+#define ofr_fseek _fseeki64
+#define ofr_ftell _ftelli64
+#else
+#define ofr_fseek fseeko
+#define ofr_ftell ftello
+#endif
+
+namespace {
+
+struct DecoderState {
+    std::unique_ptr<OFR_DecoderEngine> engine;
+    uint32_t bitrate = 0;
+    int64_t noPoints = 0;
+    int64_t originalSize = 0;
+    int64_t compressedSize = 0;
+    int64_t length_ms = 0;
+    uint64_t position = 0;   // in values
+    bool tail_read = false;
+    bool has_tags = false;
+    OFR_TagList tags;
+    std::vector<int32_t> samples;
+};
+
+DecoderState* state_of(void* instance) { return static_cast<DecoderState*>(instance); }
+
+condition_t file_close(void* instance) { return fclose((FILE*)instance) == 0 ? C_TRUE : C_FALSE; }
+
+sInt32_t file_read(void* instance, void* buffer, uInt32_t size) {
+    FILE* f = (FILE*)instance;
+    size_t got = fread(buffer, 1, size, f);
+    return (got == 0 && ferror(f)) ? -1 : (sInt32_t)got;
+}
+
+condition_t file_eof(void* instance) { return feof((FILE*)instance) ? C_TRUE : C_FALSE; }
+
+condition_t file_seekable(void* instance) { return ofr_fseek((FILE*)instance, 0, SEEK_CUR) == 0 ? C_TRUE : C_FALSE; }
+
+sInt64_t file_length(void* instance) {
+    FILE* f = (FILE*)instance;
+    sInt64_t pos = ofr_ftell(f), size = -1;
+    if (pos >= 0 && ofr_fseek(f, 0, SEEK_END) == 0) {
+        size = ofr_ftell(f);
+        ofr_fseek(f, pos, SEEK_SET);
+    }
+    return size;
+}
+
+sInt64_t file_getPos(void* instance) { return ofr_ftell((FILE*)instance); }
+
+condition_t file_seek(void* instance, sInt64_t pos) { return ofr_fseek((FILE*)instance, pos, SEEK_SET) == 0 ? C_TRUE : C_FALSE; }
+
+ReadInterface file_interface = {file_close, file_read, file_eof, file_seekable, file_length, file_getPos, file_seek};
+
+// the sample types of the container, unsigned ones stored with a bias
+void pack_samples(const int32_t* src, uint32_t count, uint8_t* dst, uint32_t sample_type, bool max16bit) {
+    const uint32_t bits = ofr_sample_bits(sample_type);
+    const bool is_unsigned = sample_type < OFR_SAMPLE_FLOAT32 && (sample_type & 1) == 0;
+    const uint32_t bias = is_unsigned ? 1u << (bits - 1) : 0u;
+    const uint32_t bytes = bits / 8;
+    const bool reduce = max16bit && bits > 16 && sample_type < OFR_SAMPLE_FLOAT32;
+    const uint32_t skip = reduce ? bytes - 2 : 0, width = reduce ? 2 : bytes;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t v = (uint32_t)src[i] + bias;
+        for (uint32_t b = 0; b < width; b++) *dst++ = (uint8_t)(v >> (8 * (b + skip)));
+    }
+}
+
+} // namespace
+
+OFR_DerivedInfo ofr_derived_info(OFR_DecoderEngine& e) {
+    OFR_DerivedInfo d;
+    d.noPoints = (int64_t)(e.total_samples / e.channels);
+    d.originalSize = (int64_t)((e.bitspersample / 8) * e.total_samples + e.head.size());
+    d.compressedSize = e.stream().seekable() ? e.stream().length() : 0;
+    d.length_ms = trunc_to_int64_cvttsd2si((double)d.noPoints * 1000.0 / (double)e.samplerate);
+    const double raw_rate = (double)(uint32_t)(e.samplerate * e.bitspersample * e.channels);
+    if (d.originalSize != 0 && d.compressedSize != 0) {
+        d.bitrate = (uint32_t)trunc_to_int64_cvttsd2si((double)d.compressedSize / (double)d.originalSize * raw_rate / 1000.0);
+    } else {
+        d.bitrate = (uint32_t)trunc_to_int64_cvttsd2si(raw_rate / 1000.0);
+    }
+    return d;
+}
 
 extern "C" {
 
@@ -11,497 +103,266 @@ uInt32_t OptimFROG_getVersion(void) {
 }
 
 void* OptimFROG_createInstance(void) {
-    auto* instance = new OptimFROG_InternalState();
-    memset(instance, 0, sizeof(OptimFROG_InternalState));
-    return instance;
+    return new (std::nothrow) DecoderState();
 }
 
 void OptimFROG_destroyInstance(void* decoderInstance) {
-    if (decoderInstance) {
-        auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-        if (instance->pInterface) {
-            instance->pInterface->close();
-            delete instance->pInterface;
-        }
-        OptimFROG_freeTags(&instance->tags);
-        delete instance;
-    }
+    delete state_of(decoderInstance);
 }
 
 condition_t OptimFROG_openExt(void* decoderInstance, ReadInterface* rInt, void* readerInstance, condition_t readTags) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    instance->is_opened = false;
-    instance->pInterface = nullptr;
+    DecoderState* s = state_of(decoderInstance);
+    s->engine.reset();
+    s->has_tags = false;
+    s->tags.clear();
 
-    OFR_DecoderEngine* pOVar7 = nullptr;
-
-    if (rInt->seekable(readerInstance) == C_FALSE) {
-        pOVar7 = new OFR_DecoderEngine();
-        instance->pInterface = pOVar7;
-    } else {
-        sInt64_t pos = rInt->getPos(readerInstance);
-        char magic = 0;
-        sInt32_t bytesRead = rInt->read(readerInstance, &magic, 1);
-        rInt->seek(readerInstance, pos);
-
-        if (bytesRead != 1 || magic != '*') {
-            pOVar7 = new OFR_DecoderEngine();
-            instance->pInterface = pOVar7;
-        } else {
-            pOVar7 = new OFR_DecoderEngine();
-            instance->pInterface = pOVar7;
-        }
-    }
-
-    ReadInterfaceWrapper* wrapper = new ReadInterfaceWrapper{rInt, readerInstance};
-    if (!pOVar7->open(wrapper)) {
-        delete pOVar7;
-        delete wrapper;
-        instance->pInterface = nullptr;
+    try {
+        s->engine = std::make_unique<OFR_DecoderEngine>(rInt, readerInstance);
+    } catch (const std::bad_alloc&) {
+        rInt->close(readerInstance);
         return C_FALSE;
-    } else {
-        uint32_t headSize = pOVar7->headSize;
-        instance->noPoints = pOVar7->total_samples / pOVar7->channels;
-        instance->originalSize = (pOVar7->bitspersample / 8) * pOVar7->total_samples + headSize;
-
-        sInt64_t compSize = 0;
-        if (rInt->length) {
-            compSize = rInt->length(readerInstance);
-        }
-        instance->compressedSize = compSize;
-
-        double dVar2 = 1000.0;
-        uint32_t samplerate = pOVar7->samplerate;
-        instance->length_ms = (sInt64_t)(((double)instance->noPoints * dVar2) / (double)samplerate);
-
-        if (instance->originalSize == 0 || instance->compressedSize == 0) {
-            instance->bitrate = (sInt32_t)(sInt64_t)((double)(samplerate * pOVar7->bitspersample * pOVar7->channels) / dVar2);
-        } else {
-            instance->bitrate = (sInt32_t)(sInt64_t)((((double)instance->compressedSize / (double)instance->originalSize) * 
-                                                  (double)(samplerate * pOVar7->bitspersample * pOVar7->channels)) / dVar2);
-        }
-
-        instance->has_tags = C_FALSE;
-        if (readTags != C_FALSE) {
-            // Read tags logic placeholder
-            instance->has_tags = C_TRUE;
-        }
-
-        instance->points_read_so_far = 0;
-        instance->is_opened = true;
-        instance->tail_read = false;
-        return C_TRUE;
     }
-}
 
-struct FileWrapper {
-    FILE* file;
-    sInt64_t size;
-};
-
-static condition_t file_close(void* instance) {
-    FileWrapper* fw = (FileWrapper*)instance;
-    if (fw->file) {
-        fclose(fw->file);
-        fw->file = nullptr;
+    OFR_DecoderEngine& e = *s->engine;
+    try {
+        e.open();
+        if (readTags) {
+            s->tags = ofr_read_tags(e.stream());
+            s->has_tags = !s->tags.empty();
+        }
+    } catch (const std::exception&) {
+        s->engine.reset();
+        return C_FALSE;
     }
-    delete fw;
+
+    const OFR_DerivedInfo derived = ofr_derived_info(e);
+    s->noPoints = derived.noPoints;
+    s->originalSize = derived.originalSize;
+    s->compressedSize = derived.compressedSize;
+    s->length_ms = derived.length_ms;
+    s->bitrate = derived.bitrate;
+
+    s->position = 0;
+    s->tail_read = false;
     return C_TRUE;
 }
 
-static sInt32_t file_read(void* instance, void* buffer, uInt32_t size) {
-    FileWrapper* fw = (FileWrapper*)instance;
-    return (sInt32_t)fread(buffer, 1, size, fw->file);
-}
-
-static condition_t file_eof(void* instance) {
-    FileWrapper* fw = (FileWrapper*)instance;
-    return feof(fw->file) ? C_TRUE : C_FALSE;
-}
-
-static condition_t file_seekable(void*) {
-    return C_TRUE;
-}
-
-static sInt64_t file_length(void* instance) {
-    FileWrapper* fw = (FileWrapper*)instance;
-    return fw->size;
-}
-
-static sInt64_t file_getPos(void* instance) {
-    FileWrapper* fw = (FileWrapper*)instance;
-    return ftell(fw->file);
-}
-
-static condition_t file_seek(void* instance, sInt64_t pos) {
-    FileWrapper* fw = (FileWrapper*)instance;
-    return fseek(fw->file, pos, SEEK_SET) == 0 ? C_TRUE : C_FALSE;
-}
-
-condition_t OptimFROG_open(void* decoderInstance, char* fileName, condition_t readTags) {
+condition_t OptimFROG_open(void* decoderInstance, const char* fileName, condition_t readTags) {
     FILE* file = fopen(fileName, "rb");
-    if (!file) {
-        return OptimFROG_OpenError;
-    }
-
-    fseek(file, 0, SEEK_END);
-    sInt64_t size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    FileWrapper* fw = new FileWrapper{file, size};
-
-    ReadInterface* rInt = new ReadInterface();
-    rInt->close = file_close;
-    rInt->read = file_read;
-    rInt->eof = file_eof;
-    rInt->seekable = file_seekable;
-    rInt->length = file_length;
-    rInt->getPos = file_getPos;
-    rInt->seek = file_seek;
-
-    condition_t res = OptimFROG_openExt(decoderInstance, rInt, fw, readTags);
-    if (res != C_TRUE) {
-        file_close(fw);
-        delete rInt;
-        return OptimFROG_OpenError;
-    }
-    return OptimFROG_NoError;
+    if (!file) return C_FALSE;
+    return OptimFROG_openExt(decoderInstance, &file_interface, file, readTags);
 }
 
 condition_t OptimFROG_close(void* decoderInstance) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->is_opened) return OptimFROG_NoError;
-    if (instance->pInterface) {
-        instance->pInterface->close();
-        delete instance->pInterface;
-        instance->pInterface = nullptr;
-    }
-    instance->is_opened = false;
-    return OptimFROG_NoError;
+    DecoderState* s = state_of(decoderInstance);
+    if (!s || !s->engine) return C_FALSE;
+    s->engine.reset();
+    s->has_tags = false;
+    s->tags.clear();
+    return C_TRUE;
 }
 
 sInt32_t OptimFROG_readHead(void* decoderInstance, void* headData, uInt32_t maxSize) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->pInterface) return 0;
-    auto* pInt = instance->pInterface;
-    if (pInt->headSize <= maxSize && pInt->headSize != 0) {
-        memcpy(headData, pInt->headData, pInt->headSize);
-    }
-    return pInt->headSize;
+    DecoderState* s = state_of(decoderInstance);
+    if (!s || !s->engine) return 0;
+    const std::vector<uint8_t>& head = s->engine->head;
+    if (!head.empty() && head.size() <= maxSize) std::memcpy(headData, head.data(), head.size());
+    return (sInt32_t)head.size();
 }
 
 sInt32_t OptimFROG_readTail(void* decoderInstance, void* tailData, uInt32_t maxSize) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->pInterface) return -1;
-    auto* pInt = instance->pInterface;
-    
-    if (instance->points_read_so_far != instance->noPoints) {
-        return -1;
+    DecoderState* s = state_of(decoderInstance);
+    if (!s || !s->engine || s->position != s->engine->total_samples) return -1;
+
+    if (!s->tail_read) {
+        try {
+            s->engine->read_tail();
+        } catch (const std::exception&) {
+            return -1;
+        }
+        s->tail_read = true;
     }
-    
-    if (!instance->tail_read) {
-        bool res = pInt->readTail();
-        instance->tail_read = true;
-        if (!res) return 0;
-    }
-    
-    if (pInt->tailSize > maxSize) return -1;
-    
-    if (pInt->tailSize != 0 && pInt->tailData != nullptr) {
-        memcpy(tailData, pInt->tailData, pInt->tailSize);
-    }
-    return pInt->tailSize;
+
+    const std::vector<uint8_t>& tail = s->engine->tail;
+    if (!tail.empty() && tail.size() <= maxSize) std::memcpy(tailData, tail.data(), tail.size());
+    return (sInt32_t)tail.size();
 }
 
 condition_t OptimFROG_seekable(void* decoderInstance) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->pInterface) return C_FALSE;
-    OFR_BitStream* bs = instance->pInterface->bitstream;
-    if (!bs || !bs->wrapper) return C_FALSE;
-    return bs->wrapper->rInt->seekable(bs->wrapper->readerInstance);
+    DecoderState* s = state_of(decoderInstance);
+    return (s && s->engine && s->engine->stream().seekable()) ? C_TRUE : C_FALSE;
 }
 
 condition_t OptimFROG_seekPoint(void* decoderInstance, sInt64_t point) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->is_opened || !instance->pInterface) return C_FALSE;
-    
-    auto* pInt = instance->pInterface;
-    // points_read_so_far tracks FRAMES throughout this file (see OptimFROG_read's clamp/
-    // increment below) -- total_samples is the one field in "values" (frames*channels).
-    sInt64_t sample_pos = point * pInt->channels;
+    DecoderState* s = state_of(decoderInstance);
+    if (!s || !s->engine || point < 0) return C_FALSE;
 
-    if (sample_pos < pInt->total_samples) {
-        if (pInt->seek(point)) {
-            instance->points_read_so_far = point;
-            return C_TRUE;
+    uint64_t target = (uint64_t)point * s->engine->channels;
+    bool ok = false;
+    if (s->engine->stream().seekable() && target < s->engine->total_samples) {
+        try {
+            ok = s->engine->seek(target);
+        } catch (const std::exception&) {
+            ok = false;
         }
     }
-
-    instance->points_read_so_far = instance->noPoints;
-    return C_FALSE;
+    s->position = ok ? target : s->engine->total_samples;
+    return ok ? C_TRUE : C_FALSE;
 }
 
 condition_t OptimFROG_seekTime(void* decoderInstance, sInt64_t milliseconds) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->pInterface) return C_FALSE;
-    sInt64_t point = (sInt64_t)((double)milliseconds / 1000.0 * instance->pInterface->samplerate);
-    return OptimFROG_seekPoint(decoderInstance, point);
+    DecoderState* s = state_of(decoderInstance);
+    if (!s || !s->engine) return C_FALSE;
+    double point = (double)milliseconds / 1000.0 * (double)s->engine->samplerate;
+    return OptimFROG_seekPoint(decoderInstance, trunc_to_int64_cvttsd2si(point));
 }
 
 sInt64_t OptimFROG_getPos(void* decoderInstance) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->pInterface) return 0;
-    return instance->points_read_so_far; // already frames, see OptimFROG_read/seekPoint
+    DecoderState* s = state_of(decoderInstance);
+    return (s && s->engine) ? (sInt64_t)(s->position / s->engine->channels) : 0;
 }
 
 condition_t OptimFROG_recoverableErrors(void* decoderInstance) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->pInterface) return C_FALSE;
-    return instance->pInterface->has_recoverable_errors ? C_TRUE : C_FALSE;
+    DecoderState* s = state_of(decoderInstance);
+    return (s && s->engine && s->engine->has_recoverable_errors) ? C_TRUE : C_FALSE;
 }
 
 sInt32_t OptimFROG_read(void* decoderInstance, void* data, uInt32_t noPoints, condition_t max16bit) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->is_opened || !instance->pInterface) return -1;
-    
-    auto* pInt = instance->pInterface;
-    
-    sInt64_t points_to_read = noPoints;
-    sInt64_t points_left = instance->noPoints - instance->points_read_so_far;
-    
-    if (points_to_read > points_left) {
-        points_to_read = points_left;
-    }
-    
-    if (points_to_read == 0) return 0;
-    
-    sInt64_t samples_to_read = points_to_read * pInt->channels;
-    
-    int* temp_buffer = (int*)malloc(samples_to_read * sizeof(int));
-    if (!temp_buffer) return -1;
-    
-    uInt32_t points_read = pInt->read(temp_buffer, (uInt32_t)points_to_read);
-    uInt32_t samples_read = points_read * pInt->channels;
-    
-    int stype = pInt->sample_type;
-    
-    if (stype == 0 || stype == 1) { // 8 bit
-        for (sInt64_t i = 0; i < samples_read; ++i) {
-            ((uint8_t*)data)[i] = (uint8_t)((stype == 0 ? 0x80 : 0) + temp_buffer[i]);
-        }
-    } else if (stype == 2 || stype == 3) { // 16 bit
-        int offset = (stype == 2) ? 0x8000 : 0;
-        for (sInt64_t i = 0; i < samples_read; ++i) {
-            int val = temp_buffer[i] + offset;
-            ((uint8_t*)data)[i*2] = val & 0xFF;
-            ((uint8_t*)data)[i*2+1] = (val >> 8) & 0xFF;
-        }
-    } else if (stype == 4 || stype == 5) { // 24 bit
-        int offset = (stype == 4) ? 0x800000 : 0;
-        if (!max16bit) {
-            for (sInt64_t i = 0; i < samples_read; ++i) {
-                int val = temp_buffer[i] + offset;
-                ((uint8_t*)data)[i*3] = val & 0xFF;
-                ((uint8_t*)data)[i*3+1] = (val >> 8) & 0xFF;
-                ((uint8_t*)data)[i*3+2] = (val >> 16) & 0xFF;
-            }
-        } else {
-            for (sInt64_t i = 0; i < samples_read; ++i) {
-                int val = temp_buffer[i] + offset;
-                ((uint8_t*)data)[i*2] = (val >> 8) & 0xFF;
-                ((uint8_t*)data)[i*2+1] = (val >> 16) & 0xFF;
-            }
-        }
-    } else if (stype == 6 || stype == 7) { // 32 bit
-        int offset = (stype == 6) ? 0x80000000 : 0;
-        if (!max16bit) {
-            for (sInt64_t i = 0; i < samples_read; ++i) {
-                int val = temp_buffer[i] + offset;
-                ((uint8_t*)data)[i*4] = val & 0xFF;
-                ((uint8_t*)data)[i*4+1] = (val >> 8) & 0xFF;
-                ((uint8_t*)data)[i*4+2] = (val >> 16) & 0xFF;
-                ((uint8_t*)data)[i*4+3] = (val >> 24) & 0xFF;
-            }
-        } else {
-            for (sInt64_t i = 0; i < samples_read; ++i) {
-                int val = temp_buffer[i] + offset;
-                ((uint8_t*)data)[i*2] = (val >> 16) & 0xFF;
-                ((uint8_t*)data)[i*2+1] = (val >> 24) & 0xFF;
-            }
-        }
-    } else if (stype == 8 || stype == 9 || stype == 10) { // FLOAT32_*: temp_buffer already holds
-        // the reconstructed IEEE754 bit pattern per sample (see OFR_DecoderEngine::
-        // reconstruct_float_block) -- just pack it as a native little-endian float32 container.
-        for (sInt64_t i = 0; i < samples_read; ++i) {
-            int32_t val = temp_buffer[i];
-            ((uint8_t*)data)[i*4] = val & 0xFF;
-            ((uint8_t*)data)[i*4+1] = (val >> 8) & 0xFF;
-            ((uint8_t*)data)[i*4+2] = (val >> 16) & 0xFF;
-            ((uint8_t*)data)[i*4+3] = (val >> 24) & 0xFF;
-        }
-    } else {
-        free(temp_buffer);
+    DecoderState* s = state_of(decoderInstance);
+    if (!s || !s->engine) return -1;
+    OFR_DecoderEngine& e = *s->engine;
+
+    // one engine call for the whole request, as in the reference: after a decoding error the rest
+    // of the slice turns to silence, so the slice size shows in the output of a damaged file. the
+    // product is 32-bit in the reference too.
+    const uint32_t want = (uint32_t)std::min<uint64_t>((uint32_t)(noPoints * e.channels), e.total_samples - s->position);
+    uint32_t got = 0;
+    try {
+        if (s->samples.size() < want) s->samples.resize(want);
+        got = e.read(s->samples.data(), want, false);
+    } catch (const std::exception&) {
         return -1;
     }
-
-    free(temp_buffer);
-    instance->points_read_so_far += points_read;
-    return points_read;
+    pack_samples(s->samples.data(), got, (uint8_t*)data, e.sample_type, max16bit != C_FALSE);
+    s->position += got;
+    if (s->samples.size() > (1u << 22)) std::vector<int32_t>().swap(s->samples);
+    return (sInt32_t)(got / e.channels);
 }
 
 condition_t OptimFROG_getInfo(void* decoderInstance, OptimFROG_Info* info) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->is_opened || !instance->pInterface) return C_FALSE;
-    auto* pInt = instance->pInterface;
-    
-    info->channels = pInt->channels;
-    info->samplerate = pInt->samplerate;
-    info->bitspersample = pInt->bitspersample;
-    info->bitrate = instance->bitrate;
-    info->version = pInt->version;
-    info->method = "fast"; // simplified placeholder for now
-    info->speedup = "normal"; // simplified placeholder for now
-    info->noPoints = instance->noPoints;
-    info->originalSize = instance->originalSize;
-    info->compressedSize = instance->compressedSize;
-    info->length_ms = instance->length_ms;
-    info->sampleType = "signed 16-bit"; // placeholder
-    info->channelConfig = "stereo"; // placeholder
-    
+    DecoderState* s = state_of(decoderInstance);
+    if (!s || !s->engine) return C_FALSE;
+    const OFR_DecoderEngine& e = *s->engine;
+
+    info->channels = e.channels;
+    info->samplerate = e.samplerate;
+    info->bitspersample = e.bitspersample;
+    info->bitrate = s->bitrate;
+    info->version = e.version;
+    info->method = ofr_method_name(e.method);
+    info->speedup = ofr_speedup_name(e.speedup);
+    info->noPoints = s->noPoints;
+    info->originalSize = s->originalSize;
+    info->compressedSize = s->compressedSize;
+    info->length_ms = s->length_ms;
+    info->sampleType = ofr_sample_type_name(e.sample_type);
+    info->channelConfig = ofr_channel_config_name(e.channel_config);
     return C_TRUE;
 }
 
 condition_t OptimFROG_getTags(void* decoderInstance, OptimFROG_Tags* tags) {
-    auto* instance = static_cast<OptimFROG_InternalState*>(decoderInstance);
-    if (!instance || !instance->is_opened || !instance->has_tags) {
-        if (tags) tags->keyCount = 0;
-        return C_FALSE;
+    tags->keyCount = 0;
+    DecoderState* s = state_of(decoderInstance);
+    if (!s || !s->engine || !s->has_tags) return C_FALSE;
+
+    for (const auto& tag : s->tags) {
+        char* key = (char*)std::malloc(tag.first.size() + 1);
+        char* value = (char*)std::malloc(tag.second.size() + 1);
+        if (!key || !value) {
+            std::free(key);
+            std::free(value);
+            break;
+        }
+        std::memcpy(key, tag.first.c_str(), tag.first.size() + 1);
+        std::memcpy(value, tag.second.c_str(), tag.second.size() + 1);
+        tags->keys[tags->keyCount] = key;
+        tags->values[tags->keyCount] = value;
+        tags->keyCount++;
     }
-    
-    tags->keyCount = instance->tags.keyCount;
-    for (uInt32_t i = 0; i < tags->keyCount; ++i) {
-        tags->keys[i] = strdup(instance->tags.keys[i]);
-        tags->values[i] = strdup(instance->tags.values[i]);
-    }
-    
     return C_TRUE;
 }
 
 void OptimFROG_freeTags(OptimFROG_Tags* tags) {
     if (!tags) return;
     for (uInt32_t i = 0; i < tags->keyCount; ++i) {
-        free(tags->keys[i]);
+        std::free(tags->keys[i]);
         tags->keys[i] = nullptr;
-        free(tags->values[i]);
+        std::free(tags->values[i]);
         tags->values[i] = nullptr;
     }
     tags->keyCount = 0;
 }
 
-sInt32_t OptimFROG_decodeFile(char* sourceFile, char* destinationFile, OptimFROG_callBack callBack, void* callBackParam) {
-    void* decoderInstance = OptimFROG_createInstance();
-    if (!decoderInstance) return OptimFROG_MemoryError;
-    
-    void* buffer = malloc(0x2b110);
-    if (!buffer) {
-        OptimFROG_destroyInstance(decoderInstance);
+sInt32_t OptimFROG_decodeFile(const char* sourceFile, const char* destinationFile, OptimFROG_callBack callBack, void* callBackParam) {
+    std::unique_ptr<void, decltype(&OptimFROG_destroyInstance)> decoder(OptimFROG_createInstance(), OptimFROG_destroyInstance);
+    if (!decoder) return OptimFROG_MemoryError;
+    void* inst = decoder.get();
+
+    if (!OptimFROG_open(inst, sourceFile, C_FALSE)) return OptimFROG_OpenError;
+
+    OptimFROG_Info info{};
+    OptimFROG_getInfo(inst, &info);
+
+    std::unique_ptr<FILE, int (*)(FILE*)> out(fopen(destinationFile, "wb"), fclose);
+    if (!out) return OptimFROG_WriteError;
+
+    auto write_bytes = [&out](const std::vector<uint8_t>& bytes, size_t n) {
+        return n == 0 || fwrite(bytes.data(), 1, n, out.get()) == n;
+    };
+
+    try {
+        // one second of 44.1 kHz stereo 16-bit, the chunk the official library works in
+        std::vector<uint8_t> buffer(0x2b110);
+
+        size_t head_size = (size_t)OptimFROG_readHead(inst, nullptr, 0);
+        if (head_size > buffer.size()) buffer.resize(head_size);
+        OptimFROG_readHead(inst, buffer.data(), (uInt32_t)buffer.size());
+        if (!write_bytes(buffer, head_size)) return OptimFROG_WriteError;
+
+        const uint32_t bytes_per_point = (info.bitspersample / 8) * info.channels;
+        const uint32_t points_per_chunk = 0x2b110 / bytes_per_point;
+        sInt64_t points_read = 0;
+        while (points_read < info.noPoints) {
+            if (callBack) callBack(callBackParam, (double)points_read * 100.0 / (double)info.noPoints);
+            sInt32_t got = OptimFROG_read(inst, buffer.data(), points_per_chunk, C_FALSE);
+            if (got < 1) return OptimFROG_FatalError;
+            if (!write_bytes(buffer, (size_t)got * bytes_per_point)) return OptimFROG_WriteError;
+            points_read += got;
+        }
+
+        sInt32_t tail_size = OptimFROG_readTail(inst, nullptr, 0);
+        if (tail_size < 0) return OptimFROG_FatalError;
+        if ((size_t)tail_size > buffer.size()) buffer.resize((size_t)tail_size);
+        OptimFROG_readTail(inst, buffer.data(), (uInt32_t)buffer.size());
+        if (!write_bytes(buffer, (size_t)tail_size)) return OptimFROG_WriteError;
+    } catch (const std::bad_alloc&) {
         return OptimFROG_MemoryError;
     }
-    
-    if (!OptimFROG_open(decoderInstance, sourceFile, C_FALSE)) {
-        OptimFROG_destroyInstance(decoderInstance);
-        free(buffer);
-        return OptimFROG_OpenError;
-    }
-    
-    OptimFROG_Info info{};
-    OptimFROG_getInfo(decoderInstance, &info);
-    
-    FILE* outFile = fopen(destinationFile, "wb");
-    if (!outFile) {
-        OptimFROG_close(decoderInstance);
-        OptimFROG_destroyInstance(decoderInstance);
-        free(buffer);
-        return OptimFROG_WriteError;
-    }
-    
-    uInt32_t headSize = OptimFROG_readHead(decoderInstance, buffer, 0x2b110);
-    if (fwrite(buffer, 1, headSize, outFile) != headSize) {
-        OptimFROG_close(decoderInstance);
-        OptimFROG_destroyInstance(decoderInstance);
-        free(buffer);
-        fclose(outFile);
-        return OptimFROG_WriteError;
-    }
-    
-    sInt64_t points_read = 0;
-    uInt32_t bytes_per_point = (info.bitspersample / 8) * info.channels;
-    uInt32_t points_per_chunk = 10;
-    
-    while (points_read < 10) {
-        if (callBack) {
-            callBack(callBackParam, (double)points_read * 100.0 / (double)info.noPoints);
-        }
-        
-        sInt32_t read_points = OptimFROG_read(decoderInstance, buffer, points_per_chunk, C_FALSE);
-        if (read_points < 1) goto L_FATAL;
-        
-        size_t bytes_to_write = read_points * bytes_per_point;
-        if (fwrite(buffer, 1, bytes_to_write, outFile) != bytes_to_write) {
-            OptimFROG_close(decoderInstance);
-            OptimFROG_destroyInstance(decoderInstance);
-            free(buffer);
-            fclose(outFile);
-            return OptimFROG_WriteError;
-        }
-        points_read += read_points;
-    }
-    
-    {
-        sInt32_t tailSize = OptimFROG_readTail(decoderInstance, buffer, 0x2b110);
-        if (tailSize < 0) goto L_FATAL;
-        
-        if (fwrite(buffer, 1, tailSize, outFile) != (size_t)tailSize) {
-            OptimFROG_close(decoderInstance);
-            OptimFROG_destroyInstance(decoderInstance);
-            free(buffer);
-            fclose(outFile);
-            return OptimFROG_WriteError;
-        }
-        
-        condition_t has_err = OptimFROG_recoverableErrors(decoderInstance);
-        OptimFROG_close(decoderInstance);
-        OptimFROG_destroyInstance(decoderInstance);
-        free(buffer);
-        if (fclose(outFile) != 0) return OptimFROG_WriteError;
-        
-        return has_err ? OptimFROG_RecoverableError : OptimFROG_NoError;
-    }
 
-L_FATAL:
-    OptimFROG_close(decoderInstance);
-    OptimFROG_destroyInstance(decoderInstance);
-    free(buffer);
-    fclose(outFile);
-    return OptimFROG_FatalError;
+    bool damaged = OptimFROG_recoverableErrors(inst) != C_FALSE;
+    if (fclose(out.release()) != 0) return OptimFROG_WriteError;
+    return damaged ? OptimFROG_RecoverableError : OptimFROG_NoError;
 }
 
-sInt32_t OptimFROG_infoFile(char* sourceFile, OptimFROG_Info* info, OptimFROG_Tags* tags) {
-    void* decoderInstance = OptimFROG_createInstance();
-    if (!decoderInstance) return OptimFROG_MemoryError;
-    
-    if (OptimFROG_open(decoderInstance, sourceFile, tags != nullptr)) {
-        OptimFROG_getInfo(decoderInstance, info);
-        if (tags) {
-            OptimFROG_getTags(decoderInstance, tags);
-        }
-        OptimFROG_close(decoderInstance);
-        OptimFROG_destroyInstance(decoderInstance);
-        return OptimFROG_NoError;
-    }
-    
-    OptimFROG_destroyInstance(decoderInstance);
-    return OptimFROG_OpenError;
+sInt32_t OptimFROG_infoFile(const char* sourceFile, OptimFROG_Info* info, OptimFROG_Tags* tags) {
+    std::unique_ptr<void, decltype(&OptimFROG_destroyInstance)> decoder(OptimFROG_createInstance(), OptimFROG_destroyInstance);
+    if (!decoder) return OptimFROG_MemoryError;
+    void* inst = decoder.get();
+
+    if (!OptimFROG_open(inst, sourceFile, tags != nullptr)) return OptimFROG_OpenError;
+    OptimFROG_getInfo(inst, info);
+    if (tags) OptimFROG_getTags(inst, tags);
+    return OptimFROG_NoError;
 }
 
 } // extern "C"

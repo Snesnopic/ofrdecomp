@@ -630,16 +630,12 @@ void ofr_parallel_for(size_t count, uint32_t threads, const std::function<void(s
     if (failure) std::rethrow_exception(failure);
 }
 
-// the official decoder throws away mono blocks of order 128 for some signals (a 32-bit sine
-// does it) while 127 always decodes, so the encoder stops one short of what the format allows
-constexpr int MAX_MONO_ORDER = OFR_MAX_ORDER - 1;
-
 static bool valid_params(const OFR_EncodeParams& p, int channels, int bps) {
     if (channels != 1 && channels != 2) return false;
     if (bps != 8 && bps != 16 && bps != 24 && bps != 32) return false;
     if (p.pred < 1 || p.pred > 3 || p.ent < 1 || p.ent > 3) return false;
     if (p.pred_weight < 2 || p.pred_weight > 4096 || p.ent_weight < 2 || p.ent_weight > 4096) return false;
-    if (channels == 1) return p.mono_order >= 1 && p.mono_order <= MAX_MONO_ORDER && p.mono_interval >= 1 && p.mono_interval <= 0x10000;
+    if (channels == 1) return p.mono_order >= 1 && p.mono_order <= OFR_MAX_ORDER && p.mono_interval >= 1 && p.mono_interval <= 0x10000;
     if (p.stereo_interval_idx < 0 || p.stereo_interval_idx > 6 || p.stereo_order_idx < 0 || p.stereo_order_idx > 30) return false;
     int max_order = DAT_00326220[p.stereo_order_idx], right_order = DAT_00326200[p.stereo_order_idx];
     return max_order >= 1 && max_order <= OFR_MAX_ORDER && right_order <= max_order - right_order;

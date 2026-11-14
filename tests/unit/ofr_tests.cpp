@@ -170,9 +170,9 @@ void test_invalid_params() {
     p.stereo_order_idx = 8;   // order 256: past what the format's predictor can hold
     CHECK(!ofr_encode(s.data(), 100, 2, 44100, 16, p, file));
     p = OFR_EncodeParams();
-    p.mono_order = 128;       // past what the official decoder reliably handles
+    p.mono_order = 129;
     CHECK(!ofr_encode(s.data(), 100, 1, 44100, 16, p, file));
-    p.mono_order = 127;
+    p.mono_order = 128;
     CHECK(ofr_encode(s.data(), 100, 1, 44100, 16, p, file));
 }
 

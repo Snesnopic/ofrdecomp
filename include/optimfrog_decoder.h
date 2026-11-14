@@ -261,7 +261,9 @@ public:
     int min_val = -0x800000;
     int max_val = 0x7fffff;
 
+    // predict() reads in groups of 4, so both arrays carry 4 zeros past their logical end
     std::vector<double> history_buffer;
+    int history_size = 0;
     double* history_head = nullptr;
 
     std::vector<double> vector_R;

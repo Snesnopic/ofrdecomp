@@ -13,9 +13,8 @@ There are three levels of evidence, and they aren't interchangeable:
 
 The rewrite after commit `46c3868` (the last full CI run) was checked with **Golden** (1476 encode
 and decode combinations, no byte differs from `46c3868`), with **Local**, and on 2026-11-14 with
-**Reference** against the official library (`libOptimFROG.0.dylib` under Rosetta): direction B of
-`run.sh` and `sdk_diff.sh`. Direction A and the Float and DualStream suites need the official
-`ofr`/`off`/`ofs` tools, which weren't available locally; CI runs them.
+**Reference** against the official v5.100 package under Rosetta: `run.sh` in both directions,
+`run_float.sh`, `run_dualstream.sh` and `sdk_diff.sh`.
 
 ## Coverage
 
@@ -25,13 +24,13 @@ and decode combinations, no byte differs from `46c3868`), with **Local**, and on
 | Lossless encoder, same matrix | Reference |
 | `pred_type=2`, mono and stereo, `ent` 1 and 3 | Reference, direction B. No file from the official encoder is known to use it |
 | Encoder with several blocks, types varying per block | Reference, direction B, including 1.5M-frame signals |
-| Encoder orders: stereo up to 128, mono up to 127 | Reference, direction B. See below for mono 128 |
+| Encoder orders up to 128, mono and stereo | Reference, direction B |
 | C API: return values, `readHead`/`readTail`, seek, `decodeFile`, `infoFile`, tags, custom readers | Reference, `sdk_diff.sh` |
 | Damaged and truncated files | Reference: `sdk_files.py` patterns, and 559 of 560 random single-bit damages (see [format.md](format.md)); fuzzed |
 | Float decoder and encoder, ordinary values, zeros | Reference (CI at `46c3868`), Golden since |
-| Float subnormals, infinities, NaNs | Local. *Pending*, needs `off` |
-| DualStream decoder, mono and stereo | Reference, by hand; no script |
-| Full-scale DualStream files (post-processor clamp) | Read from the disassembly. *Pending*, needs `ofs` |
+| Float subnormals, infinities, NaNs | Reference, both directions (the build at `46c3868` got subnormals wrong) |
+| DualStream decoder, mono and stereo, 16/24-bit, qualities 0 to 10, modes fast/normal/best | Reference, `run_dualstream.sh` |
+| Full-scale DualStream files (post-processor clamp) | Reference, `run_dualstream.sh` (the build at `46c3868` failed 22 of 84 such cases) |
 
 The Linux reference library decodes some `pred=3` streams differently from the macOS one, so the
 Linux CI job leaves cascade predictors out. See the comment in `.github/workflows/conformance.yml`.
@@ -47,9 +46,12 @@ comparison first.
 
 Predictor orders stop at 128: the reference keeps its covariance matrices in 128-row arrays, so
 the 192 and 256 entries of its order table can't work. That explains the desync seen long ago at
-those orders. Mono order 128 itself is legal, and decoded files using it are accepted, but the
-official decoder throws away such blocks for some signals (a 32-bit sine does it) while 127 always
-worked. The encoder therefore stops at 127 in mono.
+those orders.
+
+The mono LPC prediction is an SSE dot product in the reference (pairs joined with `haddpd` into two
+running sums). A plain sequential sum, used here until 2026-11, rounds differently often enough at
+32 bits and orders 96 to 128 to change a prediction now and then: files from the official encoder's
+`insane`/`ultra` modes decoded wrong, and the official decoder rejected some of this encoder's.
 
 ## Not implemented
 

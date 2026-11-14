@@ -73,8 +73,8 @@ dirB() {
       pred2e3) rtry_out "$of" env OFR_PRED=2 OFR_ENT=3 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
       blocks)  rtry_out "$of" env OFR_PRED=1 OFR_ENT=2 OFR_BLOCK=1500 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
       blocksp3) rtry_out "$of" env OFR_PRED=3 OFR_ENT=2 OFR_BLOCK=1500 "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
-      # every order the format's tables offer within the 128-row matrices (127 is the mono limit)
-      order*)  local idx="${mode#order}" orders=(12 24 36 48 64 96 127)
+      # every order the format's tables offer within the 128-row matrices
+      order*)  local idx="${mode#order}" orders=(12 24 36 48 64 96 128)
                rtry_out "$of" env OFR_PRED=1 OFR_ENT=1 OFR_ODIDX="$idx" OFR_ORDER="${orders[$idx]}" "$OFRENC" "$raw" "$of" "$rate" "$ch" "$bps";;
     esac
     if [ ! -s "$of" ]; then note "B enc $tag $mode (no output)"; continue; fi

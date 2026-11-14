@@ -70,6 +70,8 @@ it.
 ctest --test-dir build                              # no external files needed
 bash tests/conformance/run.sh                       # lossless, against the official binaries
 bash tests/conformance/run_float.sh                 # IEEE Float, against the official binaries
+bash tests/conformance/run_dualstream.sh            # DualStream decoding, against the official ofs
+bash tests/conformance/sdk_diff.sh                  # C API, against the official library
 ```
 
 The conformance scripts check both directions: files from the official encoder decode identically

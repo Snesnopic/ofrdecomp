@@ -12,16 +12,16 @@ void OFR_Predictor::init(int ord, int interval, double damp) {
     last_update_count = 0;
     fail_count = 0;
     
-    int hist_size = std::max(1024, order * 2);
-    history_buffer.assign(hist_size, 0.0);
+    history_size = std::max(1024, order * 2);
+    history_buffer.assign((size_t)history_size + 4, 0.0);
     vector_R.assign(order + 1, 0.0);
-    weights.assign(order + 1, 0.0);
+    weights.assign(order + 4, 0.0);
     if (order > 0) weights[0] = 1.0;  // binary: FUN_00014dc0 initializes weights[0]=1.0
     temp_D.assign(order + 1, 0.0);
     inst_matrix.assign(order + 1, std::vector<double>(order + 1, 0.0));
     cov_matrix.assign(order + 1, std::vector<double>(order + 1, 0.0));
     
-    history_head = history_buffer.data() + hist_size - order;
+    history_head = history_buffer.data() + history_size - order;
 }
 
 void OFR_Predictor::init(OFR_RangeCoder* rc) {
@@ -38,12 +38,17 @@ void OFR_Predictor::init(OFR_RangeCoder* rc) {
     this->init(ord, interval, ((double)weight_param - 1.0) / (double)weight_param);
 }
 
+// FUN_00014ce0: SSE dot product, pairs joined with haddpd into two running sums. at 32 bits and
+// high orders a plain sequential sum rounds differently often enough to change the prediction
 double OFR_Predictor::predict() {
-    double sum = 0.0;
-    for (int i = 0; i < order; i++) {
-        sum += history_head[i] * weights[i];
+    double a0 = 0.0, a1 = 0.0;
+    const double* h = history_head;
+    const double* w = weights.data();
+    for (int n = 0; n < order; n += 4) {
+        a0 = (h[n] * w[n] + h[n + 1] * w[n + 1]) + a0;
+        a1 = (h[n + 2] * w[n + 2] + h[n + 3] * w[n + 3]) + a1;
     }
-    return sum;
+    return a1 + a0;
 }
 
 void OFR_Predictor::update_cov_1() {
@@ -157,13 +162,12 @@ void OFR_Predictor::update(double sample) {
 
     if (history_head == history_buffer.data()) {
         if (order > 0) {
-            int hist_size = (int)history_buffer.size();
-            int j = hist_size - order;
+            int j = history_size - order;
             for (int i = 0; i < order; i++) {
                 history_buffer[j++] = history_head[i];
             }
         }
-        history_head = history_buffer.data() + history_buffer.size() - order;
+        history_head = history_buffer.data() + history_size - order;
     }
     history_head--;
     history_head[0] = sample;

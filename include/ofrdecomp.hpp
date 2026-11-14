@@ -168,7 +168,7 @@ private:
 struct EncodeOptions {
     int predictor = 1;          ///< 1 LPC, 2 cascade NLMS, 3 LPC + cascade NLMS.
     int entropy = 1;            ///< 1 fast, 2 slow, 3 context modeling.
-    int monoOrder = 64;         ///< Mono LPC order, 1 to 127.
+    int monoOrder = 64;         ///< Mono LPC order, 1 to 128.
     int stereoOrderIndex = 1;   ///< Stereo LPC order, as an index into the format's order table.
     uint32_t blockFrames = 1u << 20; ///< Frames per independent block, 0 for as few as possible.
     uint32_t threads = 1;       ///< Blocks encoded in parallel.

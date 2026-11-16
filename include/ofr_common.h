@@ -33,13 +33,10 @@ inline int32_t round_to_int32_cvtsd2si(double x) {
 #endif
 }
 
-// x86 cvttsd2si semantics: truncate toward zero, same out-of-range sentinel.
+// x86 cvttsd2si semantics: truncate toward zero, same out-of-range sentinel. no intrinsic here:
+// gcc 13 folds _mm_cvttsd_si32 on an out-of-range constant to a saturated value.
 inline int32_t trunc_to_int32_cvttsd2si(double x) {
-#if defined(OFR_HAVE_SSE2)
-    return _mm_cvttsd_si32(_mm_set_sd(x));
-#else
     return (x > -2147483649.0 && x < 2147483648.0) ? (int32_t)x : INT32_MIN;
-#endif
 }
 
 inline int64_t trunc_to_int64_cvttsd2si(double x) {
